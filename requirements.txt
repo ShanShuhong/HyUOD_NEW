@@ -1,0 +1,13 @@
+torch>=1.13.0
+torchvision>=0.14.0
+numpy>=1.21.0
+opencv-python>=4.5.0
+pycocotools>=2.0.6
+Pillow>=9.0.0
+scipy>=1.7.0
+tqdm>=4.62.0
+tensorboard>=2.10.0
+pyyaml>=6.0
+addict>=2.4.0
+yapf>=0.31.0
+matplotlib>=3.5.0
