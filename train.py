@@ -26,8 +26,9 @@ if __name__ == "__main__":
         optimizer='SGD',
         pretrained=False,
         imgsz=640,
-        # workers=12,
-        iou=0.4
+        workers=4,
+        iou=0.4,
+        device=0
     )
 
 # # Load a model
