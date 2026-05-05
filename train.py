@@ -26,6 +26,7 @@ if __name__ == "__main__":
         optimizer='SGD',
         pretrained=False,
         imgsz=640,
+        # workers
         workers=4,
         iou=0.4,
         device=0
