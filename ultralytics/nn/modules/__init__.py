@@ -65,6 +65,9 @@ from .block import (
     A_block,
     frequent_block,
     C3k2_wcpm,
+    C3k2_DSConv,
+    C3k2_PConv,
+    CrossAttentionFusion,
 )
 from .conv import (
     CBAM,

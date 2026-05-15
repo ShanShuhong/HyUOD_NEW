@@ -6,6 +6,7 @@ import math
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 __all__ = (
     "Conv",
@@ -681,6 +682,9 @@ class Concat(nn.Module):
         Returns:
             (torch.Tensor): Concatenated tensor.
         """
+        target_size = x[0].shape[2:]
+        if any(t.shape[2:] != target_size for t in x):
+            x = [t if t.shape[2:] == target_size else F.interpolate(t, size=target_size, mode="nearest") for t in x]
         return torch.cat(x, self.d)
 
 

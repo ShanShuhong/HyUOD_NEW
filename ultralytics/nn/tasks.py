@@ -71,6 +71,9 @@ from ultralytics.nn.modules import (
     t_block,
     A_block,
     C3k2_wcpm,
+    C3k2_DSConv,
+    C3k2_PConv,
+    CrossAttentionFusion,
 )
 from ultralytics.utils import DEFAULT_CFG_DICT, DEFAULT_CFG_KEYS, LOGGER, colorstr, emojis, yaml_load
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
@@ -1146,6 +1149,9 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             t_block,
             A_block,
             C3k2_wcpm,
+            C3k2_DSConv,
+            C3k2_PConv,
+            frequent_block,
         }
     )
     repeat_modules = frozenset(  # modules with 'repeat' arguments
@@ -1165,7 +1171,9 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             C2fCIB,
             C2PSA,
             A2C2f,
-            C3k2_wcpm
+            C3k2_wcpm,
+            C3k2_DSConv,
+            C3k2_PConv,
         }
     )
     for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):  # from, number, module, args
@@ -1215,6 +1223,11 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             args = [ch[f]]
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
+        elif m is CrossAttentionFusion:
+            c2 = args[0]
+            if c2 != nc:
+                c2 = make_divisible(min(c2, max_channels) * width, 8)
+            args = [[ch[x] for x in f], c2, *args[1:]]
         elif m in frozenset({Detect, WorldDetect, Segment, Pose, OBB, ImagePoolingAttn, v10Detect}):
             args.append([ch[x] for x in f])
             if m is Segment:
