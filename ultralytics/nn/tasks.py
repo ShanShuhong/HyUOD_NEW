@@ -22,6 +22,7 @@ from ultralytics.nn.modules import (
     SPP,
     SPPELAN,
     SPPF,
+    PP_Align,
     A2C2f,
     AConv,
     ADown,
@@ -1105,6 +1106,8 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
     if verbose:
         LOGGER.info(f"\n{'':>3}{'from':>20}{'n':>3}{'params':>10}  {'module':<45}{'arguments':<30}")
     ch = [ch]
+    def _ch(idx):
+        return ch[idx] if isinstance(idx, int) else sum(ch[x] for x in idx)
     layers, save, c2 = [], [], ch[-1]  # layers, savelist, ch out
     base_modules = frozenset(
         {
@@ -1177,20 +1180,28 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
         }
     )
     for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):  # from, number, module, args
-        m = (
-            getattr(torch.nn, m[3:])
-            if "nn." in m
-            else getattr(__import__("torchvision").ops, m[16:])
-            if "torchvision.ops." in m
-            else globals()[m]
-        )  # get module
+        # Resolve module name string 'm' to an actual class/constructor
+        if "nn." in m:
+            m = getattr(torch.nn, m[3:])
+        elif "torchvision.ops." in m:
+            m = getattr(__import__("torchvision").ops, m[16:])
+        else:
+            try:
+                m = globals()[m]
+            except Exception:
+                # Fallback to looking up in ultralytics.nn.modules package so custom blocks
+                # defined in `ultralytics/nn/modules/*` are discoverable without being
+                # explicitly imported into this module's globals().
+                from ultralytics.nn import modules as _modules
+
+                m = getattr(_modules, m)
         for j, a in enumerate(args):
             if isinstance(a, str):
                 with contextlib.suppress(ValueError):
                     args[j] = locals()[a] if a in locals() else ast.literal_eval(a)
         n = n_ = max(round(n * depth), 1) if n > 1 else n  # depth gain
         if m in base_modules:
-            c1, c2 = ch[f], args[0]
+            c1, c2 = _ch(f), args[0]
             if c2 != nc:  # if c2 not equal to number of classes (i.e. for Classify() output)
                 c2 = make_divisible(min(c2, max_channels) * width, 8)
             if m is C2fAttn:  # set 1) embed channels and 2) num heads
@@ -1210,9 +1221,9 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
                 if scale in "lx":  # for L/X sizes
                     args.extend((True, 1.2))
         elif m is AIFI:
-            args = [ch[f], *args]
+            args = [_ch(f), *args]
         elif m in frozenset({HGStem, HGBlock}):
-            c1, cm, c2 = ch[f], args[0], args[1]
+            c1, cm, c2 = _ch(f), args[0], args[1]
             args = [c1, cm, c2, *args[2:]]
             if m is HGBlock:
                 args.insert(4, n)  # number of repeats
@@ -1220,7 +1231,7 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
         elif m is ResNetLayer:
             c2 = args[1] if args[3] else args[1] * 4
         elif m is torch.nn.BatchNorm2d:
-            args = [ch[f]]
+            args = [_ch(f)]
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
         elif m is CrossAttentionFusion:
@@ -1238,16 +1249,27 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             args.insert(1, [ch[x] for x in f])
         elif m is CBLinear:
             c2 = args[0]
-            c1 = ch[f]
+            c1 = _ch(f)
             args = [c1, c2, *args[1:]]
         elif m is CBFuse:
             c2 = ch[f[-1]]
         elif m in frozenset({TorchVision, Index}):
             c2 = args[0]
-            c1 = ch[f]
+            c1 = _ch(f)
             args = [*args[1:]]
+        elif m is PP_Align:
+            # PP_Align consumes a tuple (rgb_feat, t_feat). Accept mismatched channels by
+            # passing both rgb and t channels to the module: [c_rgb, c_t]. If only one
+            # index is provided, fall back to that channel for both.
+            if isinstance(f, (list, tuple)) and len(f) > 1:
+                c_rgb = _ch(f[0])
+                c_t = _ch(f[1])
+            else:
+                c_rgb = c_t = _ch(f)
+            c2 = c_rgb  # output channels equal rgb channels (proj keeps rgb channels)
+            args = [[c_rgb, c_t]]
         else:
-            c2 = ch[f]
+            c2 = _ch(f)
 
         m_ = torch.nn.Sequential(*(m(*args) for _ in range(n))) if n > 1 else m(*args)  # module
         t = str(m)[8:-2].replace("__main__.", "")  # module type
