@@ -65,10 +65,6 @@ from .block import (
     A_block,
     frequent_block,
     C3k2_wcpm,
-    C3k2_DSConv,
-    C3k2_PConv,
-    CrossAttentionFusion,
-    PP_Align,
 )
 from .conv import (
     CBAM,
@@ -182,5 +178,4 @@ __all__ = (
     "First_Conv",
     "frequent_block",
     "C3k2_wcpm",
-    "PP_Align",
 )

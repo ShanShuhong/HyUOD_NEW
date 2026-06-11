@@ -13,7 +13,6 @@ from .mm_utils import Multiscale_waveletconv, SG_new, IWT, BrokenBlock
 import torch.nn.init as init
 
 from .dcnv3_torch import DCNv3_pytorch, CrossDCNv3_pytorch
-
 __all__ = (
     "DFL",
     "HGBlock",
@@ -61,12 +60,6 @@ __all__ = (
     "A_block",
     "frequent_block",
     "C3k2_wcpm",
-    "CrossAttentionFusion",
-    "DSConv",
-    "C3k2_DSConv",
-    "PConv",
-    "C3k2_PConv",
-    "PP_Align",
 )
 
 
@@ -618,15 +611,21 @@ class MaxSigmoidAttnBlock(nn.Module):
             (torch.Tensor): Output tensor after attention.
         """
         bs, _, h, w = x.shape
-        guide = self.gl(guide).view(bs, -1, self.nh, self.hc)
+
+        guide = self.gl(guide)
+        guide = guide.view(bs, -1, self.nh, self.hc)
         embed = self.ec(x) if self.ec is not None else x
         embed = embed.view(bs, self.nh, self.hc, h, w)
 
-        aw = torch.einsum("bmchw,bnmc->bmhwn", embed, guide).max(dim=-1)[0]
-        aw = aw / (self.hc ** 0.5) + self.bias[None, :, None, None]
+        aw = torch.einsum("bmchw,bnmc->bmhwn", embed, guide)
+        aw = aw.max(dim=-1)[0]
+        aw = aw / (self.hc**0.5)
+        aw = aw + self.bias[None, :, None, None]
         aw = aw.sigmoid() * self.scale
 
-        x = self.proj_conv(x).view(bs, self.nh, -1, h, w) * aw.unsqueeze(2)
+        x = self.proj_conv(x)
+        x = x.view(bs, self.nh, -1, h, w)
+        x = x * aw.unsqueeze(2)
         return x.view(bs, -1, h, w)
 
 
@@ -732,18 +731,25 @@ class ImagePoolingAttn(nn.Module):
         """
         bs = x[0].shape[0]
         assert len(x) == self.nf
-        num_patches = self.k ** 2
+        num_patches = self.k**2
         x = [pool(proj(x)).view(bs, -1, num_patches) for (x, proj, pool) in zip(x, self.projections, self.im_pools)]
         x = torch.cat(x, dim=-1).transpose(1, 2)
-        q = self.query(text).reshape(bs, -1, self.nh, self.hc)
-        k = self.key(x).reshape(bs, -1, self.nh, self.hc)
-        v = self.value(x).reshape(bs, -1, self.nh, self.hc)
+        q = self.query(text)
+        k = self.key(x)
+        v = self.value(x)
 
-        aw = torch.einsum("bnmc,bkmc->bmnk", q, k) / (self.hc ** 0.5)
+        # q = q.reshape(1, text.shape[1], self.nh, self.hc).repeat(bs, 1, 1, 1)
+        q = q.reshape(bs, -1, self.nh, self.hc)
+        k = k.reshape(bs, -1, self.nh, self.hc)
+        v = v.reshape(bs, -1, self.nh, self.hc)
+
+        aw = torch.einsum("bnmc,bkmc->bmnk", q, k)
+        aw = aw / (self.hc**0.5)
         aw = F.softmax(aw, dim=-1)
 
         x = torch.einsum("bmnk,bkmc->bnmc", aw, v)
-        return self.proj(x.reshape(bs, -1, self.ec)) * self.scale + text
+        x = self.proj(x.reshape(bs, -1, self.ec))
+        return x * self.scale + text
 
 
 class ContrastiveHead(nn.Module):
@@ -769,7 +775,8 @@ class ContrastiveHead(nn.Module):
         """
         x = F.normalize(x, dim=1, p=2)
         w = F.normalize(w, dim=-1, p=2)
-        return torch.einsum("bchw,bkc->bkhw", x, w) * self.logit_scale.exp() + self.bias
+        x = torch.einsum("bchw,bkc->bkhw", x, w)
+        return x * self.logit_scale.exp() + self.bias
 
 
 class BNContrastiveHead(nn.Module):
@@ -807,7 +814,8 @@ class BNContrastiveHead(nn.Module):
         """
         x = self.norm(x)
         w = F.normalize(w, dim=-1, p=2)
-        return torch.einsum("bchw,bkc->bkhw", x, w) * self.logit_scale.exp() + self.bias
+        x = torch.einsum("bchw,bkc->bkhw", x, w)
+        return x * self.logit_scale.exp() + self.bias
 
 
 class RepBottleneck(Bottleneck):
@@ -947,7 +955,8 @@ class ADown(nn.Module):
         x1, x2 = x.chunk(2, 1)
         x1 = self.cv1(x1)
         x2 = torch.nn.functional.max_pool2d(x2, 3, 2, 1)
-        return torch.cat((x1, self.cv2(x2)), 1)
+        x2 = self.cv2(x2)
+        return torch.cat((x1, x2), 1)
 
 
 class SPPELAN(nn.Module):
@@ -1152,9 +1161,20 @@ class RepVGGDW(torch.nn.Module):
         """
         conv = fuse_conv_and_bn(self.conv.conv, self.conv.bn)
         conv1 = fuse_conv_and_bn(self.conv1.conv, self.conv1.bn)
-        conv1_w = torch.nn.functional.pad(conv1.weight, [2, 2, 2, 2])
-        conv.weight.data.copy_(conv.weight + conv1_w)
-        conv.bias.data.copy_(conv.bias + conv1.bias)
+
+        conv_w = conv.weight
+        conv_b = conv.bias
+        conv1_w = conv1.weight
+        conv1_b = conv1.bias
+
+        conv1_w = torch.nn.functional.pad(conv1_w, [2, 2, 2, 2])
+
+        final_conv_w = conv_w + conv1_w
+        final_conv_b = conv_b + conv1_b
+
+        conv.weight.data.copy_(final_conv_w)
+        conv.bias.data.copy_(final_conv_b)
+
         self.conv = conv
         del self.conv1
 
@@ -1270,7 +1290,7 @@ class Attention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.key_dim = int(self.head_dim * attn_ratio)
-        self.scale = self.key_dim ** -0.5
+        self.scale = self.key_dim**-0.5
         nh_kd = self.key_dim * num_heads
         h = dim + nh_kd * 2
         self.qkv = Conv(dim, h, 1, act=False)
@@ -1293,9 +1313,12 @@ class Attention(nn.Module):
         q, k, v = qkv.view(B, self.num_heads, self.key_dim * 2 + self.head_dim, N).split(
             [self.key_dim, self.key_dim, self.head_dim], dim=2
         )
-        attn = ((q.transpose(-2, -1) @ k) * self.scale).softmax(dim=-1)
+
+        attn = (q.transpose(-2, -1) @ k) * self.scale
+        attn = attn.softmax(dim=-1)
         x = (v @ attn.transpose(-2, -1)).view(B, C, H, W) + self.pe(v.reshape(B, C, H, W))
-        return self.proj(x)
+        x = self.proj(x)
+        return x
 
 
 class PSABlock(nn.Module):
@@ -1347,7 +1370,8 @@ class PSABlock(nn.Module):
             (torch.Tensor): Output tensor after attention and feed-forward processing.
         """
         x = x + self.attn(x) if self.add else self.attn(x)
-        return x + self.ffn(x) if self.add else self.ffn(x)
+        x = x + self.ffn(x) if self.add else self.ffn(x)
+        return x
 
 
 class PSA(nn.Module):
@@ -1462,7 +1486,8 @@ class C2PSA(nn.Module):
             (torch.Tensor): Output tensor after processing.
         """
         a, b = self.cv1(x).split((self.c, self.c), dim=1)
-        return self.cv2(torch.cat((a, self.m(b)), 1))
+        b = self.m(b)
+        return self.cv2(torch.cat((a, b), 1))
 
 
 class C2fPSA(C2f):
@@ -1687,8 +1712,10 @@ class AAttn(nn.Module):
             .permute(0, 2, 3, 1)
             .split([self.head_dim, self.head_dim, self.head_dim], dim=2)
         )
-        attn = ((q.transpose(-2, -1) @ k) * (self.head_dim ** -0.5)).softmax(dim=-1)
-        x = (v @ attn.transpose(-2, -1)).permute(0, 3, 1, 2)
+        attn = (q.transpose(-2, -1) @ k) * (self.head_dim**-0.5)
+        attn = attn.softmax(dim=-1)
+        x = v @ attn.transpose(-2, -1)
+        x = x.permute(0, 3, 1, 2)
         v = v.permute(0, 3, 1, 2)
 
         if self.area > 1:
@@ -1698,7 +1725,9 @@ class AAttn(nn.Module):
 
         x = x.reshape(B, H, W, C).permute(0, 3, 1, 2).contiguous()
         v = v.reshape(B, H, W, C).permute(0, 3, 1, 2).contiguous()
-        return self.proj(x + self.pe(v))
+
+        x = x + self.pe(v)
+        return self.proj(x)
 
 
 class ABlock(nn.Module):
@@ -1756,7 +1785,17 @@ class ABlock(nn.Module):
                 nn.init.constant_(m.bias, 0)
 
     def forward(self, x):
-        return x + self.mlp(x + self.attn(x))
+        """
+        Forward pass through ABlock.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+
+        Returns:
+            (torch.Tensor): Output tensor after area-attention and feed-forward processing.
+        """
+        x = x + self.attn(x)
+        return x + self.mlp(x)
 
 
 class A2C2f(nn.Module):
@@ -1809,7 +1848,9 @@ class A2C2f(nn.Module):
         self.gamma = nn.Parameter(0.01 * torch.ones(c2), requires_grad=True) if a2 and residual else None
         self.m = nn.ModuleList(
             nn.Sequential(*(ABlock(c_, c_ // 32, mlp_ratio, area) for _ in range(2)))
-            if a2 else C3k(c_, c_, 2, shortcut, g) for _ in range(n)
+            if a2
+            else C3k(c_, c_, 2, shortcut, g)
+            for _ in range(n)
         )
 
     def forward(self, x):
@@ -1825,555 +1866,387 @@ class A2C2f(nn.Module):
         y = [self.cv1(x)]
         y.extend(m(y[-1]) for m in self.m)
         y = self.cv2(torch.cat(y, 1))
-        return x + self.gamma.view(-1, len(self.gamma), 1, 1) * y if self.gamma is not None else y
-
+        if self.gamma is not None:
+            return x + self.gamma.view(-1, len(self.gamma), 1, 1) * y
+        return y
 
 #### tA_process ####
 
 class Input_agent(nn.Module):
-    def __init__(self, *args, **kwargs):
-        super(Input_agent, self).__init__()
-
+    def __init__(self,  *args, **kwargs):
+            super(Input_agent, self).__init__()
     def forward(self, x):
+
         return x
-
-
+    
 class t_head(nn.Module):
     def __init__(self, c1, c2):
         super(t_head, self).__init__()
         self.down = nn.AvgPool2d(kernel_size=2, stride=2)
-        self.dyconv1 = DynamicConv(in_planes=3, out_planes=int(c2 / 2), kernel_size=3, stride=1, padding=1, bias=False)
-        self.dyconv2 = DynamicConv(in_planes=int(c2 / 2), out_planes=c2, kernel_size=3, stride=1, padding=1, bias=False)
+        self.dyconv1 =DynamicConv(in_planes=3, out_planes=int(c2/2), kernel_size=3, stride=1, padding=1, bias=False)
+        self.dyconv2 =DynamicConv(in_planes=int(c2/2), out_planes=c2, kernel_size=3, stride=1, padding=1, bias=False)
         self.silu = nn.SiLU()
-
+        
     def forward(self, x):
-        t = x[:, 3:6, :, :]
+        t = x[:,3:6,:,:]
         return self.silu(self.dyconv2(self.dyconv1(self.down(t))))
-
 
 class A_head(nn.Module):
     def __init__(self, c1, c2):
         super(A_head, self).__init__()
-        self.down = nn.AvgPool2d(kernel_size=16, stride=16)
-        self.dyconv1 = DynamicConv(in_planes=3, out_planes=int(c2 / 2), kernel_size=1, stride=1, padding=0, bias=False)
-        self.dyconv2 = DynamicConv(in_planes=int(c2 / 2), out_planes=c2, kernel_size=1, stride=1, padding=0, bias=False)
+        self.down = nn.AvgPool2d(kernel_size=32, stride=32)
+        self.dyconv1 =DynamicConv(in_planes=3, out_planes=int(c2/2), kernel_size=1, stride=1, padding=0, bias=False)
+        self.dyconv2 =DynamicConv(in_planes=int(c2/2), out_planes=c2, kernel_size=1, stride=1, padding=0, bias=False)
 
     def forward(self, x):
-        # a = torch.cat([x[:,:,:3,:],x[:,:,6:,:]],1)
-        return self.dyconv2(self.dyconv1(self.down(x[:, 6:, :, :])))
-
+        # a = torch.cat([x[:,:,:3,:],x[:,:,6:,:]],1) 
+        return self.dyconv2(self.dyconv1(self.down(x[:,6:,:,:])))
 
 class t_block(nn.Module):
     def __init__(self, c1, c2, k=3, s=1, p=1):
         super(t_block, self).__init__()
         self.down = nn.AvgPool2d(kernel_size=2, stride=2)
-        self.dyconv1 = DynamicConv(in_planes=c1, out_planes=c2, kernel_size=k, grounps=8, stride=s, padding=p,
-                                   bias=False)
+        self.dyconv1 =DynamicConv(in_planes=c1, out_planes=c2, kernel_size=k, grounps=8, stride=s, padding=p, bias=False)
         self.silu = nn.SiLU()
-
+        self.c1 = c1
+        self.c2 = c2
+        
     def forward(self, x):
-        return self.silu(self.dyconv1(self.down(channel_shuffle(x, 8))))
-
-
+        return self.silu(self.dyconv1(self.down(channel_shuffle(x,8))))
+    
 class A_block(nn.Module):
     def __init__(self, c1, c2, level, down=False, k=1, s=1, p=0):
         super(A_block, self).__init__()
         # self.down = nn.AvgPool2d(kernel_size=2, stride=2)
         self.dyconv1 = DynamicConv(in_planes=c1, out_planes=c2, kernel_size=k, stride=s, padding=p, bias=False)
-        self.upsample = nn.Upsample(scale_factor=2 ** (4 - level), mode='nearest')
+        self.upsample = nn.Upsample(scale_factor=2**(4-level), mode='nearest')
         if down is True:
-            self.scale = 2 ** (5 - level)
+            self.scale = 2**(5-level)
         self.down = down
-        # return F.interpolate(x, size=target_size, mode='nearest')
-
+            # return F.interpolate(x, size=target_size, mode='nearest')
     def forward(self, x):
         # x = torch.cat([x[0][:,-3:,:,:],x[1]],1)
         if self.down is True:
             h, w = x.shape[2:]
-            x = F.interpolate(x, size=(h // self.scale, w // self.scale), mode='nearest')
-        return self.upsample(self.dyconv1(x))
-
+            target_size = (h // self.scale, w // self.scale)
+            x = F.interpolate(x, size=target_size, mode='nearest')
+        x = self.upsample(self.dyconv1(x))
+        return x
 
 class MWT_CSP_V1_newSG(nn.Module):
     def __init__(self, c1, c2, level=3, k=1, s=1, agent_conv_1=False, p=None, g=1, d=1, act=True, *args, **kwargs):
         super(MWT_CSP_V1_newSG, self).__init__()
-        c_ = c2 // 2
-        self.cv1 = Conv(c2, c_, 1, 1, p, g, act=act)
+        c_ = c2 // 2  
+        self.cv1 = Conv(c2, c_, 1, 1, p, g, act=act) 
         c_1 = c_
-        self.level = level
-        self.c1 = c1
-        self.c2 = c2
+        self.level=level
+        self.c1=c1
+        self.c2=c2
         self.k = k
         self.MW = Multiscale_waveletconv(c_1, c_1, wt_levels=level)
         self_gate = []
-        self_gate.append(SG_new(c_1, group=level + 1))
-        self_gate = self_gate + [SG_new(c_1 * 4, group=_, groups=4) for _ in range(level + 1, 0, -1)]
+        self_gate.append(SG_new(c_1,group=level+1))
+        self_gate= self_gate+[SG_new(c_1*4,group=_, groups=4) for _ in range(level+1,0,-1)]
         self.self_gate = nn.ModuleList(self_gate)
-        self.iwt = IWT(c_1, c_1, wt_levels=level, agent_conv_1=agent_conv_1)
-        self.BS = nn.Sequential(nn.BatchNorm2d(c_), nn.SiLU())
-        self.brk = BrokenBlock(c2, group=c2 // 2)
-        self.cv2 = Conv(c2, c2, 1, 1, act=act)
-
+        self.iwt = IWT(c_1,c_1,wt_levels=level,agent_conv_1=agent_conv_1)
+        self.BS = nn.Sequential(
+            nn.BatchNorm2d(c_),
+            nn.SiLU())
+        
+        self.brk = BrokenBlock(c2, group=c2//2)
+        self.cv2 = Conv(c2, c2, 1, 1, act=act) 
     def forward(self, x):
+        c1 =self.c1
+        c2 =self.c2
+        # x.shape = [batch, channel, H, W]
+        # x = self.cv1(x)  ## x-> [batch, channel, H, W]
         x = self.cv1(x)
         x_chunk, shapes_in_levels = self.MW(x)
+        ## x_chunk[0]-> (list) 4个[batch, channel, H, W]
+        ## x_chunk[>0]-> (list) n个[batch, channel, 4, H, W]
         x_chunk[0] = self.self_gate[0](torch.stack(x_chunk[0], dim=1))
-
-        for i in range(1, self.level + 1):
+        
+        for i in range(1, self.level+1):
             x_chunk_ = torch.stack(x_chunk[i], dim=1)
             # x_chunk[i]:n个[batch, channel,4,H,W] -> x_chunk_:[batch, group, channel,4,H,W]
             batch, group, channel, _, H, W = x_chunk_.size()
-            x_chunk_ = self.self_gate[i](x_chunk_.reshape(batch, group, channel * 4, H, W))
+
+            x_chunk_ = x_chunk_.reshape(batch, group, channel * 4, H, W)
+            # x_chunk_:[batch, group, channel,4,H,W] -> x_chunk_:[batch, group, channel*4, H, W]
+
+            x_chunk_ = self.self_gate[i](x_chunk_)
+            # x_chunk_:[batch, group, channel*4, H, W] -> x_chunk_:[batch, channel*4, H, W]
+
             x_chunk[i] = x_chunk_.view(batch, channel, 4, H, W)
             # x_chunk_:[batch, channel*4,H,W] -> x_chunk[i]:[batch, channel, 4, H, W]
 
-        x1 = self.BS(self.iwt([x_chunk, shapes_in_levels]))
-        y = torch.cat((x, x1), dim=1)
-        return self.cv2(self.brk(y)) if self.training else self.cv2(y)
+        x1 = self.iwt([x_chunk, shapes_in_levels])
+        x1 = self.BS(x1)
 
-
+        y = torch.cat((x, x1),dim=1)
+        if self.training:
+            y = self.brk(y)
+        else:
+            y = y
+        return self.cv2(y)
+    
 class A_inject(nn.Module):
-    """色偏全局信息注入模块：强行用全局平均池化将 A 压缩为全局标量，剔除虚警背景"""
-
-    def __init__(self, c1):
+    def __init__(self, c1, prompt_planes, k=3, s=1, p=1):
         super(A_inject, self).__init__()
-        self.global_pool = nn.AdaptiveAvgPool2d(1)
-
-        self.color_gate = nn.Sequential(
-            nn.Conv2d(c1, c1 // 2, 1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(c1 // 2, c1, 1),
-            nn.Sigmoid()
-        )
+        self.cdyconv1 = Cross_DynamicConv(prompt_planes=prompt_planes,in_planes=c1, out_planes=c1, grounps=8, kernel_size=k, stride=s, padding=p, bias=False)
+        self.cdyconv2 = Cross_DynamicConv(prompt_planes=prompt_planes,in_planes=c1, out_planes=c1, grounps=8, kernel_size=k, stride=s, padding=p, bias=False)
         self.bn = nn.BatchNorm2d(c1)
         self.silu = nn.SiLU()
-
     def forward(self, x):
+        # x is [RGB_feature, A_feature]
+        # RGB_f, A_f = torch.chunk(x, chunks=2, dim=1)
         RGB_f, A_f = x
-        global_A = self.global_pool(A_f)
-        if global_A.size(1) != self.color_gate[0].in_channels:
-            dynamic_proj = nn.Conv2d(global_A.size(1), self.color_gate[0].in_channels, 1).to(global_A.device)
-            global_A = dynamic_proj(global_A)
-        return self.silu(self.bn(RGB_f + RGB_f * self.color_gate(global_A)))
+        x = self.cdyconv1(RGB_f, A_f)
+        x = self.cdyconv2(channel_shuffle(x,8), A_f)
+        return self.silu(self.bn(x+RGB_f))
 
-
-class SoftLightHazeRemoval(nn.Module):
-    """自适应通道仿射柔光补偿模块（高保真无损梯度版）"""
-
-    def __init__(self, c1):
-        super().__init__()
-        self.c1 = c1
-        self.scale_estimator = nn.Sequential(
-            nn.Conv2d(c1, c1 // 4, 3, padding=1, bias=False),
-            nn.BatchNorm2d(c1 // 4),
-            nn.SiLU(),
-            nn.Conv2d(c1 // 4, c1, 1),
-            nn.Sigmoid()
-        )
-        self.shift_estimator = nn.Sequential(
-            nn.Conv2d(c1, c1 // 4, 3, padding=1, bias=False),
-            nn.BatchNorm2d(c1 // 4),
-            nn.SiLU(),
-            nn.Conv2d(c1 // 4, c1, 1),
-            nn.Tanh()
-        )
-        self.blend_strength = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(c1, c1 // 4, 1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(c1 // 4, 1, 1),
-            nn.Sigmoid()
-        )
-        self.fusion_gamma = nn.Parameter(torch.ones(1) * 0.5)
-
-    def forward(self, rgb_feat, t_feat):
-        scale = self.scale_estimator(t_feat)
-        shift = self.shift_estimator(t_feat)
-        blend_alpha = self.blend_strength(t_feat)
-        mean_amplitude = rgb_feat.abs().mean(dim=(2, 3), keepdim=True)
-        enhanced_feat = rgb_feat * (1.0 + scale) + shift * mean_amplitude
-        return rgb_feat + self.fusion_gamma * blend_alpha * (enhanced_feat - rgb_feat)
-
+# class t_inject(nn.Module):
+#     def __init__(self, c1, k=3, s=1, p=1):
+#         super(t_inject, self).__init__()
+#         self.conv1 = nn.Conv2d(c1, c1, 1, 1, bias=False)
+#         self.dyconv_t =Cross_DynamicConv(prompt_planes=c1, in_planes=c1, out_planes=c1, kernel_size=k, grounps=8, stride=s, padding=p, bias=False)
+#         self.gap = nn.AdaptiveAvgPool2d(1)
+#         self.SiLU = nn.SiLU()
+#         self.sm = nn.Softmax(dim=1)
+#         self.alpha = nn.Parameter(torch.zeros((1, c1, 1, 1)))
+#         self.beta = nn.Parameter(torch.ones((1, c1, 1, 1)))
+#         self.c1 = c1
+#     def forward(self, x):
+#         x, t = x
+#         _,_,h,w = x.shape
+#         I = self.conv1(x)
+#         A = self.gap(I)
+#         I_ = self.dyconv_t(I, t)
+#         attention = self.sm(t*I_)
+#         J = ((1+self.alpha)*I-self.alpha*A)*attention*self.beta + x
+#         return J
 
 class t_inject(nn.Module):
-    """改进的浑浊度(t)条件特征柔光去雾注入模块"""
-
-    def __init__(self, c1, k=3, s=1, p=1, prompt_channels=None):
+    def __init__(self, c1, k=3, s=1, p=1):
         super(t_inject, self).__init__()
-        if prompt_channels is None:
-            prompt_channels = c1
-
         self.conv1 = nn.Conv2d(c1, c1, 1, 1, bias=False)
-        self.proj_t = nn.Conv2d(prompt_channels, c1, 1) if prompt_channels != c1 else nn.Identity()
-        self.soft_light_haze = SoftLightHazeRemoval(c1)
-
+        self.dyconv_t = CrossDCNv3_pytorch(c1,c1)
         self.gap = nn.AdaptiveAvgPool2d(1)
+        self.SiLU = nn.SiLU()
+        self.sm = nn.Softmax(dim=1)
         self.alpha = nn.Parameter(torch.zeros((1, c1, 1, 1)))
         self.beta = nn.Parameter(torch.ones((1, c1, 1, 1)))
-
+        self.c1 = c1
     def forward(self, x):
         x, t = x
-        t = self.proj_t(t)
-        I_soft = self.soft_light_haze(x, t)
-        I = self.conv1(I_soft)
-        return ((1 + self.alpha) * I - self.alpha * self.gap(I)) * self.beta + I_soft
-
+        _,_,h,w = x.shape
+        I = self.conv1(x)
+        A = self.gap(I)
+        I_ = self.dyconv_t(I, t)
+        attention = self.sm(t*I_)
+        J = ((1+self.alpha)*I-self.alpha*A)*attention*self.beta + x
+        return J
 
 class frequent_block(nn.Module):
-    """频域自适应块（完全解耦多模态 + 仿射柔光去雾整合版）"""
+    """Faster Implementation of CSP Bottleneck with 2 convolutions."""
 
     def __init__(self, c1, c2, e=0.5):
         super().__init__()
-        self.c = int(c2 * e)
+        self.c = int(c2 * e)  # hidden channels
         self.cv1 = Conv(c2, 2 * self.c, 1, 1)
-        self.cv2 = Conv(5 * self.c, c2, 1)
+        self.cv2 = Conv(5 * self.c, c2, 1)  # optional act=FReLU(c2)
         self.e = e
         self.c1 = c1
         self.c2 = c2
-
-        self.total_prompt_channels = c1 - c2
-        if self.total_prompt_channels > 0:
-            self.t_channels = self.total_prompt_channels // 2
-            self.a_channels = self.total_prompt_channels - self.t_channels
-        else:
-            self.t_channels = 0
-            self.a_channels = 0
-
-        self.channel_att = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(5 * self.c, 5 * self.c // 2, 1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(5 * self.c // 2, 5 * self.c, 1),
-            nn.Sigmoid()
-        )
-        self.spatial_att = nn.Sequential(
-            nn.Conv2d(2, 1, 3, padding=1),
-            nn.Sigmoid()
-        )
-        self.ca_gamma = nn.Parameter(torch.zeros(1, 5 * self.c, 1, 1) + 0.1)
-        self.sa_gamma = nn.Parameter(torch.zeros(1, 1, 1, 1) + 0.1)
-
-        actual_t_in = self.t_channels if self.total_prompt_channels > 0 else self.c
-
         self.m = nn.ModuleList([
-            A_inject(self.c),  # 组装全局色偏注入
-            MWT_CSP_V1_newSG(self.c, self.c),
-            MWT_CSP_V1_newSG(self.c, self.c),
-            t_inject(self.c, prompt_channels=actual_t_in),  # 组装高保真柔光去雾注入
+            A_inject(self.c, c1-c2-int(c2*e)),
+            MWT_CSP_V1_newSG(self.c,self.c),
+            MWT_CSP_V1_newSG(self.c,self.c),
+            t_inject(self.c),
         ])
-
     def forward(self, x):
-        if self.c1 > self.c2:
-            rgb, t, A = torch.split(x, [self.c2, self.t_channels, self.a_channels], dim=1)
-        else:
-            rgb = x
-            t = torch.zeros_like(rgb[:, :self.c, :, :])
-            A = torch.zeros_like(rgb[:, :self.c, :, :])
-
+        """Forward pass through C2f layer."""
+        split_channels = [self.c2,int(self.c2*self.e), self.c1-self.c2-int(self.c2*self.e)]
+        assert sum(split_channels) == x.size(1)
+        rgb, t, A =  torch.split(x, split_channels, dim=1)
         y = list(self.cv1(rgb).chunk(2, 1))
-        y.extend([self.m[0]([y[-1], A])])
+        y.extend([self.m[0]([y[-1],A])])
         y.extend([self.m[2](self.m[1](y[-1]))])
-        y.extend([self.m[3]([y[-1], t])])
-
-        feat = torch.cat(y, 1)
-        feat = feat + self.ca_gamma * (feat * self.channel_att(feat))
-        avg_out = torch.mean(feat, dim=1, keepdim=True)
-        max_out, _ = torch.max(feat, dim=1, keepdim=True)
-        sa = self.spatial_att(torch.cat([avg_out, max_out], dim=1))
-        return self.cv2(feat + self.sa_gamma * (feat * sa))
-
-
+        y.extend([self.m[3]([y[-1],t])])
+        return self.cv2(torch.cat(y, 1))
+    
 class DynamicConv(nn.Module):
-    def __init__(self, in_planes, out_planes, kernel_size, stride, padding=0, dilation=1, grounps=1, bias=True, K=4,
-                 temprature=30, ratio=2, init_weight=True):
+    def __init__(self,in_planes,out_planes,kernel_size,stride,padding=0,dilation=1,grounps=1,bias=True,K=4,temprature=30,ratio=2,init_weight=True):
         super().__init__()
-        self.in_planes = in_planes
-        self.out_planes = out_planes
-        self.kernel_size = kernel_size
-        self.stride = stride
-        self.padding = padding
-        self.dilation = dilation
-        self.groups = grounps
-        self.bias = bias
-        self.K = K
-        self.attention = DyAttention(in_planes=in_planes, ratio=ratio, K=K, temprature=temprature,
-                                     init_weight=init_weight)
-        self.weight = nn.Parameter(torch.randn(K, out_planes, in_planes // grounps, kernel_size, kernel_size),
-                                   requires_grad=True)
-        self.bias = nn.Parameter(torch.randn(K, out_planes), requires_grad=True) if bias else None
-        if init_weight:
+        self.in_planes=in_planes
+        self.out_planes=out_planes
+        self.kernel_size=kernel_size
+        self.stride=stride
+        self.padding=padding
+        self.dilation=dilation
+        self.groups=grounps
+        self.bias=bias
+        self.K=K
+        self.init_weight=init_weight
+        self.attention=DyAttention(in_planes=in_planes,ratio=ratio,K=K,temprature=temprature,init_weight=init_weight)
+
+        self.weight=nn.Parameter(torch.randn(K,out_planes,in_planes//grounps,kernel_size,kernel_size),requires_grad=True)
+        if(bias):
+            self.bias=nn.Parameter(torch.randn(K,out_planes),requires_grad=True)
+        else:
+            self.bias=None
+        
+        if(self.init_weight):
             self._initialize_weights()
 
+        #TODO 初始化
     def _initialize_weights(self):
         for i in range(self.K):
             nn.init.kaiming_uniform_(self.weight[i])
 
-    def forward(self, x):
-        bs, _, h, w = x.shape
-        softmax_att = self.attention(x)
-        x = x.contiguous().view(1, -1, h, w)
-        weight = self.weight.view(self.K, -1)
-        aggregate_weight = torch.mm(softmax_att, weight).view(bs * self.out_planes, self.in_planes // self.groups,
-                                                              self.kernel_size, self.kernel_size)
+    def forward(self,x):
+        bs,in_planels,h,w=x.shape
+        softmax_att=self.attention(x) #bs,K
+        x=x.contiguous().view(1,-1,h,w)
+        weight=self.weight.view(self.K,-1) #K,-1
+        aggregate_weight=torch.mm(softmax_att,weight).view(bs*self.out_planes,self.in_planes//self.groups,self.kernel_size,self.kernel_size) #bs*out_p,in_p,k,k
 
-        if self.bias is not None:
-            bias = self.bias.view(self.K, -1)
-            aggregate_bias = torch.mm(softmax_att, bias).view(-1)
-            output = F.conv2d(x, weight=aggregate_weight, bias=aggregate_bias, stride=self.stride, padding=self.padding,
-                              groups=self.groups * bs, dilation=self.dilation)
+        if(self.bias is not None):
+            bias=self.bias.view(self.K,-1) #K,out_p
+            aggregate_bias=torch.mm(softmax_att,bias).view(-1) #bs,out_p
+            output=F.conv2d(x,weight=aggregate_weight,bias=aggregate_bias,stride=self.stride,padding=self.padding,groups=self.groups*bs,dilation=self.dilation)
         else:
-            output = F.conv2d(x, weight=aggregate_weight, bias=None, stride=self.stride, padding=self.padding,
-                              groups=self.groups * bs, dilation=self.dilation)
-        return output.view(bs, self.out_planes, h, w)
-
+            output=F.conv2d(x,weight=aggregate_weight,bias=None,stride=self.stride,padding=self.padding,groups=self.groups*bs,dilation=self.dilation)
+        
+        output=output.view(bs,self.out_planes,h,w)
+        return output
 
 class Cross_DynamicConv(nn.Module):
-    def __init__(self, prompt_planes, in_planes, out_planes, kernel_size, stride, padding=0, dilation=1, grounps=1,
-                 bias=True, K=4, temprature=30, ratio=2, init_weight=True):
+    def __init__(self,prompt_planes, in_planes,out_planes,kernel_size,stride,padding=0,dilation=1,grounps=1,bias=True,K=4,temprature=30,ratio=2,init_weight=True):
         super().__init__()
-        self.in_planes = in_planes
-        self.out_planes = out_planes
-        self.kernel_size = kernel_size
-        self.stride = stride
-        self.padding = padding
-        self.dilation = dilation
-        self.groups = grounps
-        self.K = K
-        self.attention = DyAttention(in_planes=prompt_planes, ratio=ratio, K=K, temprature=temprature,
-                                     init_weight=init_weight)
-        self.weight = nn.Parameter(torch.randn(K, out_planes, in_planes // grounps, kernel_size, kernel_size),
-                                   requires_grad=True)
-        self.bias = nn.Parameter(torch.randn(K, out_planes), requires_grad=True) if bias else None
-        if init_weight:
+        self.in_planes=in_planes
+        self.out_planes=out_planes
+        self.kernel_size=kernel_size
+        self.stride=stride
+        self.padding=padding
+        self.dilation=dilation
+        self.groups=grounps
+        self.bias=bias
+        self.K=K
+        self.init_weight=init_weight
+        self.attention=DyAttention(in_planes=prompt_planes,ratio=ratio,K=K,temprature=temprature,init_weight=init_weight)
+
+        self.weight=nn.Parameter(torch.randn(K,out_planes,in_planes//grounps,kernel_size,kernel_size),requires_grad=True)
+        if(bias):
+            self.bias=nn.Parameter(torch.randn(K,out_planes),requires_grad=True)
+        else:
+            self.bias=None
+        
+        if(self.init_weight):
             self._initialize_weights()
 
+        #TODO 初始化
     def _initialize_weights(self):
         for i in range(self.K):
             nn.init.kaiming_uniform_(self.weight[i])
 
-    def forward(self, x, prompt):
-        bs, _, h, w = x.shape
-        softmax_att = self.attention(prompt)
-        x = x.contiguous().view(1, -1, h, w)
-        weight = self.weight.view(self.K, -1)
-        aggregate_weight = torch.mm(softmax_att, weight).view(bs * self.out_planes, self.in_planes // self.groups,
-                                                              self.kernel_size, self.kernel_size)
+    def forward(self,x,prompt):
+        bs,in_planels,h,w=x.shape
+        softmax_att=self.attention(prompt) #bs,K
+        x=x.contiguous().view(1,-1,h,w)
+        weight=self.weight.view(self.K,-1) #K,-1
+        aggregate_weight=torch.mm(softmax_att,weight).view(bs*self.out_planes,self.in_planes//self.groups,self.kernel_size,self.kernel_size) #bs*out_p,in_p,k,k
 
-        if self.bias is not None:
-            bias = self.bias.view(self.K, -1)
-            aggregate_bias = torch.mm(softmax_att, bias).view(-1)
-            output = F.conv2d(x, weight=aggregate_weight, bias=aggregate_bias, stride=self.stride, padding=self.padding,
-                              groups=self.groups * bs, dilation=self.dilation)
+        if(self.bias is not None):
+            bias=self.bias.view(self.K,-1) #K,out_p
+            aggregate_bias=torch.mm(softmax_att,bias).view(-1) #bs,out_p
+            output=F.conv2d(x,weight=aggregate_weight,bias=aggregate_bias,stride=self.stride,padding=self.padding,groups=self.groups*bs,dilation=self.dilation)
         else:
-            output = F.conv2d(x, weight=aggregate_weight, bias=None, stride=self.stride, padding=self.padding,
-                              groups=self.groups * bs, dilation=self.dilation)
-        return output.view(bs, self.out_planes, h, w)
-
+            output=F.conv2d(x,weight=aggregate_weight,bias=None,stride=self.stride,padding=self.padding,groups=self.groups*bs,dilation=self.dilation)
+        
+        output=output.view(bs,self.out_planes,h,w)
+        return output
 
 class DyAttention(nn.Module):
-    def __init__(self, in_planes, ratio, K, temprature=30, init_weight=True):
+    def __init__(self,in_planes,ratio,K,temprature=30,init_weight=True):
         super().__init__()
-        self.avgpool = nn.AdaptiveAvgPool2d(1)
-        self.temprature = temprature
-        assert in_planes > ratio
-        self.net = nn.Sequential(
-            nn.Conv2d(in_planes, in_planes // ratio, kernel_size=1, bias=False),
+        self.avgpool=nn.AdaptiveAvgPool2d(1)
+        self.temprature=temprature
+        assert in_planes>ratio
+        hidden_planes=in_planes//ratio
+        self.net=nn.Sequential(
+            nn.Conv2d(in_planes,hidden_planes,kernel_size=1,bias=False),
             nn.ReLU(),
-            nn.Conv2d(in_planes // ratio, K, kernel_size=1, bias=False)
+            nn.Conv2d(hidden_planes,K,kernel_size=1,bias=False)
         )
-        if init_weight:
+
+        if(init_weight):
             self._initialize_weights()
 
     def update_temprature(self):
-        if self.temprature > 1:
-            self.temprature -= 1
+        if(self.temprature>1):
+            self.temprature-=1
 
     def _initialize_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-            if isinstance(m, nn.BatchNorm2d):
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            if isinstance(m ,nn.BatchNorm2d):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
 
-    def forward(self, x):
-        att = self.net(self.avgpool(x)).view(x.shape[0], -1)
-        return F.softmax(att / self.temprature, -1)
-
+    def forward(self,x):
+        att=self.avgpool(x) #bs,dim,1,1
+        att=self.net(att).view(x.shape[0],-1) #bs,K
+        return F.softmax(att/self.temprature,-1)
 
 def channel_shuffle(x, groups):
-    batchsize, num_channels, height, width = x.data.size()
-    channels_per_group = num_channels // groups
-    return x.view(batchsize, groups, channels_per_group, height, width).transpose(1, 2).contiguous().view(batchsize, -1,
-                                                                                                          height, width)
-
+   batchsize, num_channels, height, width = x.data.size()
+   channels_per_group = num_channels // groups
+   x = x.view(batchsize, groups, channels_per_group, height, width)
+   x = torch.transpose(x, 1, 2).contiguous()
+   x = x.view(batchsize, -1, height, width)
+   return x
 
 class C3k2_wcpm(nn.Module):
     """Faster Implementation of CSP Bottleneck with 2 convolutions."""
 
     def __init__(self, c1, c2, n=1, c3k=False, e=0.5, g=1, shortcut=True):
-        super().__init__()
-        self.c = int(c2 * e)
-        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
-        self.cv2 = Conv((3 + n) * self.c, c2, 1)
-        self.m = nn.ModuleList(
-            C3k(self.c, self.c, 2, shortcut, g) if c3k else Bottleneck(self.c, self.c, shortcut, g) for _ in range(n))
-        self.mcpm = nn.ModuleList([MWT_CSP_V1_newSG(self.c, self.c), MWT_CSP_V1_newSG(self.c, self.c)])
+        """
+        Initialize a CSP bottleneck with 2 convolutions.
 
+        Args:
+            c1 (int): Input channels.
+            c2 (int): Output channels.
+            n (int): Number of Bottleneck blocks.
+            shortcut (bool): Whether to use shortcut connections.
+            g (int): Groups for convolutions.
+            e (float): Expansion ratio.
+        """
+        super().__init__()
+        self.c = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
+        self.cv2 = Conv((3 + n) * self.c, c2, 1)  # optional act=FReLU(c2)
+        self.m = nn.ModuleList(
+            C3k(self.c, self.c, 2, shortcut, g) if c3k else Bottleneck(self.c, self.c, shortcut, g) for _ in range(n)
+        )
+        self.mcpm = nn.ModuleList([            
+            MWT_CSP_V1_newSG(self.c,self.c),
+            MWT_CSP_V1_newSG(self.c,self.c),
+            ])
+        
     def forward(self, x):
+        """Forward pass through C2f layer."""
         y = list(self.cv1(x).chunk(2, 1))
         y.extend(m(y[-1]) for m in self.m)
         y.extend([self.mcpm[1](self.mcpm[0](y[-1]))])
         return self.cv2(torch.cat(y, 1))
 
     def forward_split(self, x):
+        """Forward pass using split() instead of chunk()."""
         y = self.cv1(x).split((self.c, self.c), 1)
         y = [y[0], y[1]]
         y.extend(m(y[-1]) for m in self.m)
         return self.cv2(torch.cat(y, 1))
-
-
-class CrossAttentionFusion(nn.Module):
-    def __init__(self, c1, c2, ratio=0.25):
-        super().__init__()
-        self.c_rgb, self.c_t, self.c_a = c1
-        self.c_rgb_part = int(self.c_rgb * ratio)
-        self.c_rgb_identity = self.c_rgb - self.c_rgb_part
-        self.gate_conv = nn.Sequential(
-            nn.Conv2d(self.c_t + self.c_a, 16, 1),
-            nn.SiLU(),
-            nn.Conv2d(16, 1, 1),
-            nn.Sigmoid()
-        )
-        self.cv_out = Conv(self.c_rgb, c2, 1)
-
-    def forward(self, x):
-        rgb, t, a = x
-        target_size = rgb.shape[2:]
-        if t.shape[2:] != target_size:
-            t = F.interpolate(t, size=target_size, mode="nearest")
-        if a.shape[2:] != target_size:
-            a = F.interpolate(a, size=target_size, mode="nearest")
-        gate = self.gate_conv(torch.cat([t, a], dim=1))
-        rgb_part, rgb_id = torch.split(rgb, [self.c_rgb_part, self.c_rgb_identity], dim=1)
-        return self.cv_out(torch.cat([rgb_part * gate, rgb_id], dim=1))
-
-
-class PConv(nn.Module):
-    """Partial Convolution for memory-efficient training."""
-
-    def __init__(self, c1, c2, k=3, s=1, p=1, g=1, act=True, n_div=4):
-        super().__init__()
-        self.dim_conv = c1 // n_div
-        self.dim_untouched = c1 - self.dim_conv
-        self.partial_conv3x3 = nn.Conv2d(self.dim_conv, self.dim_conv, k, s, p, bias=False)
-        self.cv_out = Conv(c1, c2, 1) if c1 != c2 else nn.Identity()
-
-    def forward(self, x):
-        x1, x2 = torch.split(x, [self.dim_conv, self.dim_untouched], dim=1)
-        return self.cv_out(torch.cat((self.partial_conv3x3(x1), x2), dim=1))
-
-
-class C3k2_PConv(C3k2):
-    """C3k2 with PConv for memory-efficient and high-performance training."""
-
-    def __init__(self, c1, c2, n=1, c3k=False, e=0.5, g=1, shortcut=True):
-        super().__init__(c1, c2, n, c3k, e, g, shortcut)
-        self.m = nn.ModuleList(
-            PConv(self.c, self.c) if i == 0 else Bottleneck(self.c, self.c, shortcut, g, k=((3, 3), (3, 3)), e=1.0)
-            for i in range(n)
-        )
-
-
-class DSConv(nn.Module):
-    def __init__(self, in_ch, out_ch, kernel_size, extend_scope=1.0, morph=0, if_offset=True, device='cuda'):
-        super(DSConv, self).__init__()
-        self.morph = morph
-        self.if_offset = if_offset
-        self.kernel_size = kernel_size
-        self.extend_scope = extend_scope
-        self.device = device
-        self.gn = nn.GroupNorm(out_ch // 4, out_ch)
-        self.bn = nn.BatchNorm2d(out_ch)
-        self.act = nn.SiLU()
-        self.conv = nn.Conv2d(in_ch, out_ch, kernel_size=kernel_size, padding=(kernel_size - 1) // 2, bias=False)
-        if if_offset:
-            self.offset_conv = nn.Conv2d(in_ch, 2 * kernel_size, kernel_size=3, padding=1, bias=False)
-
-    def forward(self, x):
-        if self.if_offset:
-            offset = self.offset_conv(x)
-        return self.act(self.bn(self.conv(x)))
-
-
-class C3k2_DSConv(C3k2):
-    """C3k2 with DSConv for capturing complex underwater biological shapes."""
-
-    def __init__(self, c1, c2, n=1, c3k=False, e=0.5, g=1, shortcut=True):
-        super().__init__(c1, c2, n, shortcut, g, e)
-        self.m = nn.ModuleList(
-            DSConv(self.c, self.c, kernel_size=3) if i == 0 else Bottleneck(self.c, self.c, shortcut, g,
-                                                                            k=((3, 3), (3, 3)), e=1.0)
-            for i in range(n)
-        )
-
-
-class PP_Align(nn.Module):
-    """
-    PP-Align: align high-level RGB features with a guidance (t_feat) via a learned offset field.
-
-    Note: The original implementation assumed rgb_feat and t_feat have the same number of channels (c1). In
-    practice they may differ. To support both cases we accept either a single int `c1` (both channels equal)
-    or an iterable/tuple/list `[c_rgb, c_t]` specifying rgb and t channels respectively. The offset estimator
-    consumes `c_t` channels while the projection conv consumes `c_rgb` channels.
-    """
-
-    def __init__(self, c1):
-        super().__init__()
-        # Support passing either int or [c_rgb, c_t]
-        if isinstance(c1, (list, tuple)):
-            c_rgb, c_t = int(c1[0]), int(c1[1])
-        else:
-            c_rgb = c_t = int(c1)
-        self.c_rgb = c_rgb
-        self.c_t = c_t
-
-        # offset estimator uses t_feat channels
-        self.offset_estimator = nn.Sequential(
-            nn.Conv2d(c_t, max(1, c_t // 4), 3, padding=1, bias=False),
-            nn.BatchNorm2d(max(1, c_t // 4)),
-            nn.SiLU(),
-            nn.Conv2d(max(1, c_t // 4), 2, 1),  # dx, dy
-            nn.Tanh(),
-        )
-        # projection conv applies to the sampled rgb features
-        self.proj = nn.Conv2d(c_rgb, c_rgb, 3, padding=1)
-
-    def forward(self, x):
-        """
-        Args:
-            x: 接收来自 Concat 前的物理对齐元组 [主干RGB特征(高层上采样), 浑浊度特征(浅层细节)]
-        """
-        rgb_feat, t_feat = x
-        B, C, H, W = rgb_feat.shape
-
-        # 1. 动态自适应估计空间几何偏移量场
-        offset = self.offset_estimator(t_feat)  # [B, 2, H, W]
-
-        # 2. 生成标准规范化二维空间网格网 (Grid)
-        grid_y, grid_x = torch.meshgrid(
-            torch.linspace(-1, 1, H, device=rgb_feat.device),
-            torch.linspace(-1, 1, W, device=rgb_feat.device),
-            indexing='ij'
-        )
-        grid = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0).repeat(B, 1, 1, 1)  # [B, H, W, 2]
-
-        # 3. 将物理先验估计出的几何位移叠加到标准网格上，完成特征层“空间调焦”
-        permuted_offset = offset.permute(0, 2, 3, 1)  # [B, H, W, 2]
-        adjusted_grid = grid + permuted_offset * (2.0 / max(H, W))  # 缩放到规范化网格坐标空间
-
-        # 4. 【数理核心】：执行高保真空间双线性重采样
-        # 强行将漂移的小目标（海胆刺状拓扑、海星角状边缘）特征精准对齐，洗清特征模糊
-        aligned_rgb = F.grid_sample(rgb_feat, adjusted_grid, mode='bilinear', padding_mode='zeros', align_corners=True)
-
-        return self.proj(aligned_rgb)
