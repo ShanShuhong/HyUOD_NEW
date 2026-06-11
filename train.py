@@ -21,12 +21,13 @@ if __name__ == "__main__":
     results = model.train(
         data=args.data_yaml,
         project="",
-        epochs=400,
+        epochs=150,
+        patience=35,
         batch=16,
         optimizer='SGD',
         pretrained=False,
         imgsz=640,
-        # workers=12,
+        workers=4,
         iou=0.4
     )
 
