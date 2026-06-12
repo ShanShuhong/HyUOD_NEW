@@ -60,6 +60,7 @@ __all__ = (
     "A_block",
     "frequent_block",
     "C3k2_wcpm",
+    "TurbidityGuidedMWT",
 )
 
 
@@ -2047,32 +2048,158 @@ class t_inject(nn.Module):
         J = ((1+self.alpha)*I-self.alpha*A)*attention*self.beta + x
         return J
 
+class TurbidityGuidedMWT(nn.Module):
+    """
+    Turbidity-Guided Adaptive Wavelet Enhancement (TG-AWE).
+
+    利用MFDA提取的浑浊度(t)特征作为引导信号,估计空间退化图(degradation map),
+    动态决定哪些区域的几何结构需要通过小波频率增强进行恢复,
+    而非对整张特征图统一增强。
+
+    核心机制:
+    1. Degradation Map Estimation: t_feat → 空间退化图 [B,1,H,W]
+       - 浑浊度高的区域 → gate → 1 (需要增强)
+       - 清晰区域      → gate → 0 (保持原样)
+    2. Wavelet Enhancement: MWT对rgb_feat进行多尺度频率分解与重建
+    3. Degradation-Gated Fusion:
+       output = gate * enhanced + (1-gate) * original
+       - 退化区域: 强小波增强,恢复被散射衰减的几何结构
+       - 清晰区域: 保留原始特征,避免过度增强引入虚警
+
+    针对问题: 水下小目标在浑浊区域几何特征被衰减导致漏检,
+    通过退化引导的自适应增强,仅在需要的位置恢复几何结构。
+    """
+
+    def __init__(self, rgb_c, t_c, level=3):
+        """
+        Args:
+            rgb_c (int): RGB特征通道数 (MWT内部处理的通道).
+            t_c (int): 浑浊度(t)特征通道数.
+            level (int): 小波分解层级.
+        """
+        super().__init__()
+        self.rgb_c = rgb_c
+        self.t_c = t_c
+
+        # ── 退化图估计器: t → 空间退化分数 ──
+        # 使用t特征的空间分布来估计每个位置的退化程度
+        degrade_c = max(t_c // 2, 8)
+        self.degradation_estimator = nn.Sequential(
+            nn.Conv2d(t_c, degrade_c, 3, padding=1, bias=False),
+            nn.BatchNorm2d(degrade_c),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(degrade_c, degrade_c // 2, 3, padding=1, bias=False),
+            nn.BatchNorm2d(degrade_c // 2),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(degrade_c // 2, 1, 3, padding=1),
+            nn.Sigmoid()  # [0,1] 退化分数, 1=严重退化, 0=清晰
+        )
+
+        # ── 小波频率增强分支 ──
+        self.mwt = MWT_CSP_V1_newSG(rgb_c, rgb_c, level=level)
+
+        # ── 可学习门控强度 ──
+        # 初始化为0.5,允许网络学习最佳的增强强度
+        self.gate_gamma = nn.Parameter(torch.ones(1, 1, 1, 1) * 0.5)
+
+        # ── 退化统计量(用于监控/调试) ──
+        self.register_buffer('_mean_degradation', torch.tensor(0.0))
+
+    def forward(self, x):
+        """
+        Args:
+            x: [rgb_feat, t_feat]
+                rgb_feat: [B, rgb_c, H, W] 待增强的RGB特征
+                t_feat:   [B, t_c, H_t, W_t] 浑浊度特征
+
+        Returns:
+            [B, rgb_c, H, W] 退化引导增强后的特征
+        """
+        rgb_feat, t_feat = x
+
+        # ── 1. 空间尺寸对齐 ──
+        if rgb_feat.shape[2:] != t_feat.shape[2:]:
+            t_feat = F.interpolate(
+                t_feat, size=rgb_feat.shape[2:],
+                mode='bilinear', align_corners=False
+            )
+
+        # ── 2. 通道投影对齐(处理YOLO缩放导致的通道不匹配) ──
+        if t_feat.size(1) != self.t_c:
+            # 动态1x1投影适配不同通道数
+            proj = nn.Conv2d(t_feat.size(1), self.t_c, 1).to(t_feat.device)
+            t_feat = proj(t_feat)
+
+        # ── 3. 估计空间退化图 ──
+        degradation_map = self.degradation_estimator(t_feat)  # [B, 1, H, W]
+
+        # 记录平均退化程度(用于训练监控)
+        if self.training:
+            self._mean_degradation = degradation_map.detach().mean()
+
+        # ── 4. 小波频率增强 ──
+        enhanced = self.mwt(rgb_feat)  # [B, rgb_c, H, W]
+
+        # ── 5. 退化引导的门控融合 ──
+        # gate ∈ [0, gate_gamma]: 退化严重→增强贡献大, 清晰→保留原始
+        gate = self.gate_gamma * degradation_map  # [B, 1, H, W]
+        output = gate * enhanced + (1.0 - gate) * rgb_feat
+
+        return output
+
+
 class frequent_block(nn.Module):
-    """Faster Implementation of CSP Bottleneck with 2 convolutions."""
+    """
+    多模态频域自适应融合块 (Turbidity-Guided版本).
+
+    集成退化引导的自适应几何增强:
+    - A_inject: 全局色偏校正 (利用A特征)
+    - TurbidityGuidedMWT: 退化引导小波增强 (利用t特征的空间退化信息)
+    - t_inject: 浑浊度去雾 (利用t特征的物理大气光模型)
+    """
 
     def __init__(self, c1, c2, e=0.5):
         super().__init__()
         self.c = int(c2 * e)  # hidden channels
         self.cv1 = Conv(c2, 2 * self.c, 1, 1)
-        self.cv2 = Conv(5 * self.c, c2, 1)  # optional act=FReLU(c2)
+        self.cv2 = Conv(5 * self.c, c2, 1)
         self.e = e
         self.c1 = c1
         self.c2 = c2
+
+        # 物理先验通道数 (与原始Concat布局一致: [RGB, t, A])
+        # t_block和A_block的通道数由YAML决定,不假设它们相等
+        self.t_channels = int(c2 * e)  # t_block输出的通道数 (= self.c)
+        self.a_channels = c1 - c2 - self.t_channels  # A_block输出的通道数
+        if self.a_channels <= 0:
+            self.a_channels = self.c  # fallback
+
         self.m = nn.ModuleList([
-            A_inject(self.c, c1-c2-int(c2*e)),
-            MWT_CSP_V1_newSG(self.c,self.c),
-            MWT_CSP_V1_newSG(self.c,self.c),
-            t_inject(self.c),
+            A_inject(self.c, self.a_channels),                     # 色偏全局校正
+            TurbidityGuidedMWT(self.c, self.t_channels, level=3),  # 退化引导小波增强1
+            TurbidityGuidedMWT(self.c, self.t_channels, level=3),  # 退化引导小波增强2
+            t_inject(self.c),                                       # 浑浊度物理去雾
         ])
+
     def forward(self, x):
-        """Forward pass through C2f layer."""
-        split_channels = [self.c2,int(self.c2*self.e), self.c1-self.c2-int(self.c2*self.e)]
-        assert sum(split_channels) == x.size(1)
-        rgb, t, A =  torch.split(x, split_channels, dim=1)
+        """Forward pass with degradation-guided adaptive enhancement."""
+        # 严格按Concat布局解耦: [RGB, t(浑浊度), A(色偏)]
+        split_channels = [self.c2, self.t_channels, self.a_channels]
+        assert sum(split_channels) == x.size(1), \
+            f"Channel mismatch: {sum(split_channels)} != {x.size(1)}"
+        rgb, t, A = torch.split(x, split_channels, dim=1)
+
         y = list(self.cv1(rgb).chunk(2, 1))
-        y.extend([self.m[0]([y[-1],A])])
-        y.extend([self.m[2](self.m[1](y[-1]))])
-        y.extend([self.m[3]([y[-1],t])])
+
+        # 多模态注入管线:
+        # m[0]: A → 全局色偏校正
+        # m[1]: t → 退化引导小波增强 (级联1)
+        # m[2]: t → 退化引导小波增强 (级联2), 级联在m[1]之后
+        # m[3]: t → 浑浊度物理去雾
+        y.extend([self.m[0]([y[-1], A])])                        # A_inject: 色偏→通道级校正
+        y.extend([self.m[2]([self.m[1]([y[-1], t]), t])])        # TG-AWE 级联: t→空间退化门控增强×2
+        y.extend([self.m[3]([y[-1], t])])                        # t_inject: t→大气光模型去雾
+
         return self.cv2(torch.cat(y, 1))
     
 class DynamicConv(nn.Module):
