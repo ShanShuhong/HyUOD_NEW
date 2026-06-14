@@ -2047,24 +2047,28 @@ class t_inject(nn.Module):
 
 class TurbidityGuidedMWT(nn.Module):
     """
-    Turbidity-Guided Adaptive Wavelet Enhancement (TG-AWE).
+    Target-Aware Wavelet Enhancement (TAWE).
 
-    利用MFDA提取的浑浊度(t)特征作为引导信号,估计空间退化图(degradation map),
-    动态决定哪些区域的几何结构需要通过小波频率增强进行恢复,
-    而非对整张特征图统一增强。
+    将原始的退化驱动增强(Turbidity-Guided MWT)升级为目标感知小波增强,
+    从单纯的"哪里浑浊增强哪里"转变为"哪里既退化又可能存在目标就增强哪里"。
 
-    核心机制:
-    1. Degradation Map Estimation: t_feat → 空间退化图 [B,1,H,W]
-       - 浑浊度高的区域 → gate → 1 (需要增强)
-       - 清晰区域      → gate → 0 (保持原样)
-    2. Wavelet Enhancement: MWT对rgb_feat进行多尺度频率分解与重建
-    3. Degradation-Gated Fusion:
-       output = gate * enhanced + (1-gate) * original
-       - 退化区域: 强小波增强,恢复被散射衰减的几何结构
-       - 清晰区域: 保留原始特征,避免过度增强引入虚警
+    核心改进:
+    1. Joint Gate Prediction: gate = σ(Conv([rgb, t]))
+       - 门控权重不再仅依赖MFDA提取的浑浊度特征t
+       - 而是联合RGB检测特征与t特征,同时考虑目标存在概率与退化程度
+       - 网络自动学习关注那些既受退化影响又可能存在目标的区域
+    2. Detail Residual Injection (高频残差补偿):
+       detail = MWT(rgb) - rgb
+       output = rgb + gate * detail
+       - 不再对整幅特征图进行替换式增强
+       - 仅注入小波变换新增的高频判别信息(边缘、纹理、角点)
+       - 重点补偿海星腕足、海胆尖刺、海参轮廓边缘等关键几何特征
+       - 保持原始低频语义信息不被破坏
 
-    针对问题: 水下小目标在浑浊区域几何特征被衰减导致漏检,
-    通过退化引导的自适应增强,仅在需要的位置恢复几何结构。
+    与原始TG-AWE的本质区别:
+    - 旧: gate ← t only,  output = gate*enhanced + (1-gate)*rgb
+    - 新: gate ← [rgb,t], output = rgb + gate*(MWT(rgb) - rgb)
+    - 从"退化恢复"转变为"检测导向的判别信息增强"
     """
 
     def __init__(self, rgb_c, t_c, level=3):
@@ -2078,40 +2082,41 @@ class TurbidityGuidedMWT(nn.Module):
         self.rgb_c = rgb_c
         self.t_c = t_c
 
-        # ── 退化图估计器: t → 空间退化分数 ──
-        # 使用t特征的空间分布来估计每个位置的退化程度
-        degrade_c = max(t_c // 2, 8)
-        self.degradation_estimator = nn.Sequential(
-            nn.Conv2d(t_c, degrade_c, 3, padding=1, bias=False),
-            nn.BatchNorm2d(degrade_c),
+        # ── 联合门控预测器: Concat([rgb, t]) → 空间门控图 ──
+        # 同时编码目标语义响应(rgb)与局部退化程度(t)
+        # 使门控图能够区分"纯背景退化区"与"目标+退化区"
+        joint_c = rgb_c + t_c
+        gate_c = max(joint_c // 4, 16)
+        self.gate_predictor = nn.Sequential(
+            nn.Conv2d(joint_c, gate_c, 3, padding=1, bias=False),
+            nn.BatchNorm2d(gate_c),
             nn.SiLU(inplace=True),
-            nn.Conv2d(degrade_c, degrade_c // 2, 3, padding=1, bias=False),
-            nn.BatchNorm2d(degrade_c // 2),
+            nn.Conv2d(gate_c, gate_c // 2, 3, padding=1, bias=False),
+            nn.BatchNorm2d(gate_c // 2),
             nn.SiLU(inplace=True),
-            nn.Conv2d(degrade_c // 2, 1, 3, padding=1),
-            nn.Sigmoid()  # [0,1] 退化分数, 1=严重退化, 0=清晰
+            nn.Conv2d(gate_c // 2, 1, 3, padding=1),
+            nn.Sigmoid()  # [0,1] 门控值, 1=需要注入细节, 0=保持原样
         )
 
         # ── 小波频率增强分支 ──
         self.mwt = MWT_CSP_V1_newSG(rgb_c, rgb_c, level=level, use_broken=False)
 
         # ── 可学习门控强度 ──
-        # sigmoid(-2.0) ≈ 0.12, 保守初始化避免早期过度增强导致Recall下降
-        # 网络可在训练中学习增大 gate_gamma 以利用增强分支
-        self.gate_gamma = nn.Parameter(torch.ones(1, 1, 1, 1) * -2.0)
+        # sigmoid(0.0) = 0.5, 适中初始化让网络在训练中自行调节增强强度
+        self.gate_gamma = nn.Parameter(torch.zeros(1, 1, 1, 1))
 
-        # ── 退化统计量(用于监控/调试) ──
-        self.register_buffer('_mean_degradation', torch.tensor(0.0))
+        # ── 门控统计量(用于训练监控) ──
+        self.register_buffer('_mean_gate', torch.tensor(0.0))
 
     def forward(self, x):
         """
         Args:
             x: [rgb_feat, t_feat]
-                rgb_feat: [B, rgb_c, H, W] 待增强的RGB特征
-                t_feat:   [B, t_c, H_t, W_t] 浑浊度特征
+                rgb_feat: [B, rgb_c, H, W] 待增强的RGB检测特征
+                t_feat:   [B, t_c, H_t, W_t] MFDA提取的浑浊度特征
 
         Returns:
-            [B, rgb_c, H, W] 退化引导增强后的特征
+            [B, rgb_c, H, W] 目标感知增强后的特征
         """
         rgb_feat, t_feat = x
 
@@ -2135,32 +2140,37 @@ class TurbidityGuidedMWT(nn.Module):
                 )
                 t_feat = torch.cat([t_feat, pad], dim=1)
 
-        # ── 3. 估计空间退化图 ──
-        degradation_map = self.degradation_estimator(t_feat)  # [B, 1, H, W]
+        # ── 3. 联合门控预测: gate = σ(Conv([rgb, t])) ──
+        # 同时编码目标语义与退化信息,关注"既退化又可能存在目标"的区域
+        joint_feat = torch.cat([rgb_feat, t_feat], dim=1)  # [B, rgb_c+t_c, H, W]
+        gate_map = self.gate_predictor(joint_feat)  # [B, 1, H, W]
 
-        # 记录平均退化程度(用于训练监控)
+        # 记录平均门控值(用于训练监控)
         if self.training:
-            self._mean_degradation = degradation_map.detach().mean()
+            self._mean_gate = gate_map.detach().mean()
 
         # ── 4. 小波频率增强 ──
         enhanced = self.mwt(rgb_feat)  # [B, rgb_c, H, W]
 
-        # ── 5. 退化引导的门控融合 ──
-        # gate ∈ [0, sigmoid(gate_gamma)]: 退化严重→增强贡献大, 清晰→保留原始
-        # sigmoid约束确保gate_gamma ∈ [0,1], 防止训练中漂移到非法范围
-        gate = torch.sigmoid(self.gate_gamma) * degradation_map  # [B, 1, H, W]
-        output = gate * enhanced + (1.0 - gate) * rgb_feat
+        # ── 5. 高频残差注入 ──
+        # detail = MWT(rgb) - rgb: 仅保留小波变换新增的高频判别信息
+        # output = rgb + gate * detail: 自适应注入细节,不破坏低频语义
+        gate = torch.sigmoid(self.gate_gamma) * gate_map  # [B, 1, H, W]
+        detail = enhanced - rgb_feat  # [B, rgb_c, H, W] 高频残差
+        output = rgb_feat + gate * detail
 
         return output
 
 
 class frequent_block(nn.Module):
     """
-    多模态频域自适应融合块 (Turbidity-Guided版本).
+    多模态频域自适应融合块 (Target-Aware版本).
 
-    集成退化引导的自适应几何增强:
+    集成目标感知的小波增强与物理先验注入:
     - A_inject: 全局色偏校正 (利用A特征)
-    - TurbidityGuidedMWT: 退化引导小波增强 (利用t特征的空间退化信息)
+    - TurbidityGuidedMWT (TAWE): 目标感知小波增强 (联合rgb+t特征,
+      关注"既退化又可能存在目标"的区域,高频残差注入)
+    - MWT_CSP_V1_newSG: 级联小波增强 (无门控,避免双重抑制)
     - t_inject: 浑浊度去雾 (利用t特征的物理大气光模型)
     """
 
@@ -2188,7 +2198,7 @@ class frequent_block(nn.Module):
         ])
 
     def forward(self, x):
-        """Forward pass with degradation-guided adaptive enhancement."""
+        """Forward pass with target-aware wavelet enhancement."""
         # 严格按Concat布局解耦: [RGB, t(浑浊度), A(色偏)]
         split_channels = [self.c2, self.t_channels, self.a_channels]
         assert sum(split_channels) == x.size(1), \
@@ -2199,11 +2209,11 @@ class frequent_block(nn.Module):
 
         # 多模态注入管线:
         # m[0]: A → 全局色偏校正
-        # m[1]: t → 退化引导小波增强 (单次门控)
+        # m[1]: [rgb,t] → TAWE 目标感知小波增强 (联合门控, 高频残差注入)
         # m[2]: 级联小波增强 (无门控, 直接作用在m[1]输出上)
         # m[3]: t → 浑浊度物理去雾
         y.extend([self.m[0]([y[-1], A])])                        # A_inject: 色偏→通道级校正
-        y.extend([self.m[2](self.m[1]([y[-1], t]))])             # TG-AWE → 级联MWT (单次门控, 避免双重抑制)
+        y.extend([self.m[2](self.m[1]([y[-1], t]))])             # TAWE → 级联MWT (高频残差注入, 避免双重抑制)
         y.extend([self.m[3]([y[-1], t])])                        # t_inject: t→大气光模型去雾
 
         return self.cv2(torch.cat(y, 1))
