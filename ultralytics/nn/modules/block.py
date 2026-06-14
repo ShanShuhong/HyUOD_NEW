@@ -1935,7 +1935,7 @@ class A_block(nn.Module):
         return x
 
 class MWT_CSP_V1_newSG(nn.Module):
-    def __init__(self, c1, c2, level=3, k=1, s=1, agent_conv_1=False, p=None, g=1, d=1, act=True, *args, **kwargs):
+    def __init__(self, c1, c2, level=3, k=1, s=1, agent_conv_1=False, p=None, g=1, d=1, act=True, use_broken=True, *args, **kwargs):
         super(MWT_CSP_V1_newSG, self).__init__()
         c_ = c2 // 2  
         self.cv1 = Conv(c2, c_, 1, 1, p, g, act=act) 
@@ -1954,7 +1954,7 @@ class MWT_CSP_V1_newSG(nn.Module):
             nn.BatchNorm2d(c_),
             nn.SiLU())
         
-        self.brk = BrokenBlock(c2, group=c2//2)
+        self.brk = BrokenBlock(c2, group=c2//2) if use_broken else nn.Identity()
         self.cv2 = Conv(c2, c2, 1, 1, act=act) 
     def forward(self, x):
         c1 =self.c1
@@ -1985,10 +1985,7 @@ class MWT_CSP_V1_newSG(nn.Module):
         x1 = self.BS(x1)
 
         y = torch.cat((x, x1),dim=1)
-        if self.training:
-            y = self.brk(y)
-        else:
-            y = y
+        y = self.brk(y)  # BrokenBlock (use_broken=True) or Identity (use_broken=False)
         return self.cv2(y)
     
 class A_inject(nn.Module):
@@ -2096,11 +2093,12 @@ class TurbidityGuidedMWT(nn.Module):
         )
 
         # ── 小波频率增强分支 ──
-        self.mwt = MWT_CSP_V1_newSG(rgb_c, rgb_c, level=level)
+        self.mwt = MWT_CSP_V1_newSG(rgb_c, rgb_c, level=level, use_broken=False)
 
         # ── 可学习门控强度 ──
-        # 初始化为0.5,允许网络学习最佳的增强强度
-        self.gate_gamma = nn.Parameter(torch.ones(1, 1, 1, 1) * 0.5)
+        # sigmoid(-2.0) ≈ 0.12, 保守初始化避免早期过度增强导致Recall下降
+        # 网络可在训练中学习增大 gate_gamma 以利用增强分支
+        self.gate_gamma = nn.Parameter(torch.ones(1, 1, 1, 1) * -2.0)
 
         # ── 退化统计量(用于监控/调试) ──
         self.register_buffer('_mean_degradation', torch.tensor(0.0))
@@ -2126,9 +2124,16 @@ class TurbidityGuidedMWT(nn.Module):
 
         # ── 2. 通道投影对齐(处理YOLO缩放导致的通道不匹配) ──
         if t_feat.size(1) != self.t_c:
-            # 动态1x1投影适配不同通道数
-            proj = nn.Conv2d(t_feat.size(1), self.t_c, 1).to(t_feat.device)
-            t_feat = proj(t_feat)
+            if t_feat.size(1) > self.t_c:
+                # 输入通道过多 → 截取前 self.t_c 个通道
+                t_feat = t_feat[:, :self.t_c]
+            else:
+                # 输入通道不足 → 零填充补齐
+                pad = torch.zeros(
+                    t_feat.size(0), self.t_c - t_feat.size(1),
+                    *t_feat.shape[2:], device=t_feat.device, dtype=t_feat.dtype
+                )
+                t_feat = torch.cat([t_feat, pad], dim=1)
 
         # ── 3. 估计空间退化图 ──
         degradation_map = self.degradation_estimator(t_feat)  # [B, 1, H, W]
@@ -2141,8 +2146,9 @@ class TurbidityGuidedMWT(nn.Module):
         enhanced = self.mwt(rgb_feat)  # [B, rgb_c, H, W]
 
         # ── 5. 退化引导的门控融合 ──
-        # gate ∈ [0, gate_gamma]: 退化严重→增强贡献大, 清晰→保留原始
-        gate = self.gate_gamma * degradation_map  # [B, 1, H, W]
+        # gate ∈ [0, sigmoid(gate_gamma)]: 退化严重→增强贡献大, 清晰→保留原始
+        # sigmoid约束确保gate_gamma ∈ [0,1], 防止训练中漂移到非法范围
+        gate = torch.sigmoid(self.gate_gamma) * degradation_map  # [B, 1, H, W]
         output = gate * enhanced + (1.0 - gate) * rgb_feat
 
         return output
@@ -2175,10 +2181,10 @@ class frequent_block(nn.Module):
             self.a_channels = self.c  # fallback
 
         self.m = nn.ModuleList([
-            A_inject(self.c, self.a_channels),                     # 色偏全局校正
-            TurbidityGuidedMWT(self.c, self.t_channels, level=3),  # 退化引导小波增强1
-            TurbidityGuidedMWT(self.c, self.t_channels, level=3),  # 退化引导小波增强2
-            t_inject(self.c),                                       # 浑浊度物理去雾
+            A_inject(self.c, self.a_channels),                            # 色偏全局校正
+            TurbidityGuidedMWT(self.c, self.t_channels, level=3),         # 退化引导小波增强 (单次门控)
+            MWT_CSP_V1_newSG(self.c, self.c, level=3, use_broken=False),  # 级联小波增强 (无门控, 避免双重抑制)
+            t_inject(self.c),                                              # 浑浊度物理去雾
         ])
 
     def forward(self, x):
@@ -2193,11 +2199,11 @@ class frequent_block(nn.Module):
 
         # 多模态注入管线:
         # m[0]: A → 全局色偏校正
-        # m[1]: t → 退化引导小波增强 (级联1)
-        # m[2]: t → 退化引导小波增强 (级联2), 级联在m[1]之后
+        # m[1]: t → 退化引导小波增强 (单次门控)
+        # m[2]: 级联小波增强 (无门控, 直接作用在m[1]输出上)
         # m[3]: t → 浑浊度物理去雾
         y.extend([self.m[0]([y[-1], A])])                        # A_inject: 色偏→通道级校正
-        y.extend([self.m[2]([self.m[1]([y[-1], t]), t])])        # TG-AWE 级联: t→空间退化门控增强×2
+        y.extend([self.m[2](self.m[1]([y[-1], t]))])             # TG-AWE → 级联MWT (单次门控, 避免双重抑制)
         y.extend([self.m[3]([y[-1], t])])                        # t_inject: t→大气光模型去雾
 
         return self.cv2(torch.cat(y, 1))
