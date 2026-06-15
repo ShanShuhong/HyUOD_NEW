@@ -2045,176 +2045,117 @@ class t_inject(nn.Module):
         J = ((1+self.alpha)*I-self.alpha*A)*attention*self.beta + x
         return J
 
+
 class TurbidityGuidedMWT(nn.Module):
     """
-    Target-Aware Wavelet Enhancement (TAWE).
-
-    将原始的退化驱动增强(Turbidity-Guided MWT)升级为目标感知小波增强,
-    从单纯的"哪里浑浊增强哪里"转变为"哪里既退化又可能存在目标就增强哪里"。
-
-    核心改进:
-    1. Joint Gate Prediction: gate = σ(Conv([rgb, t]))
-       - 门控权重不再仅依赖MFDA提取的浑浊度特征t
-       - 而是联合RGB检测特征与t特征,同时考虑目标存在概率与退化程度
-       - 网络自动学习关注那些既受退化影响又可能存在目标的区域
-    2. Detail Residual Injection (高频残差补偿):
-       detail = MWT(rgb) - rgb
-       output = rgb + gate * detail
-       - 不再对整幅特征图进行替换式增强
-       - 仅注入小波变换新增的高频判别信息(边缘、纹理、角点)
-       - 重点补偿海星腕足、海胆尖刺、海参轮廓边缘等关键几何特征
-       - 保持原始低频语义信息不被破坏
-
-    与原始TG-AWE的本质区别:
-    - 旧: gate ← t only,  output = gate*enhanced + (1-gate)*rgb
-    - 新: gate ← [rgb,t], output = rgb + gate*(MWT(rgb) - rgb)
-    - 从"退化恢复"转变为"检测导向的判别信息增强"
+    Target-Aware Wavelet Enhancement (TAWE) 终极修复版
+    数理修复点：
+    1. 摒弃引发梯度断流和初始化冷启动的 gate_gamma，改用高保真残差激活机制: output = rgb + (1.0 + gate_map) * detail
+       确保即使在训练初期，高频判别细节也能无损通过。
+    2. 将门控图从单纯的空间门控(1通道)升级为通道+空间两维门控，精准捕捉海胆尖刺和海星腕足的特定通道响应。
     """
 
     def __init__(self, rgb_c, t_c, level=3):
-        """
-        Args:
-            rgb_c (int): RGB特征通道数 (MWT内部处理的通道).
-            t_c (int): 浑浊度(t)特征通道数.
-            level (int): 小波分解层级.
-        """
         super().__init__()
         self.rgb_c = rgb_c
         self.t_c = t_c
 
-        # ── 联合门控预测器: Concat([rgb, t]) → 空间门控图 ──
-        # 同时编码目标语义响应(rgb)与局部退化程度(t)
-        # 使门控图能够区分"纯背景退化区"与"目标+退化区"
+        # 联合门控预测器：结合RGB检测语义与物理退化先验
         joint_c = rgb_c + t_c
-        gate_c = max(joint_c // 4, 16)
         self.gate_predictor = nn.Sequential(
-            nn.Conv2d(joint_c, gate_c, 3, padding=1, bias=False),
-            nn.BatchNorm2d(gate_c),
+            nn.Conv2d(joint_c, rgb_c // 2, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(rgb_c // 2),
             nn.SiLU(inplace=True),
-            nn.Conv2d(gate_c, gate_c // 2, 3, padding=1, bias=False),
-            nn.BatchNorm2d(gate_c // 2),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(gate_c // 2, 1, 3, padding=1),
-            nn.Sigmoid()  # [0,1] 门控值, 1=需要注入细节, 0=保持原样
+            nn.Conv2d(rgb_c // 2, rgb_c, kernel_size=1, bias=True),  # 直接预测通道级别的对齐权重
+            nn.Sigmoid()
         )
 
-        # ── 小波频率增强分支 ──
+        # 小波频率增强核心分支
         self.mwt = MWT_CSP_V1_newSG(rgb_c, rgb_c, level=level, use_broken=False)
 
-        # ── 可学习门控强度 ──
-        # sigmoid(0.0) = 0.5, 适中初始化让网络在训练中自行调节增强强度
-        self.gate_gamma = nn.Parameter(torch.zeros(1, 1, 1, 1))
-
-        # ── 门控统计量(用于训练监控) ──
-        self.register_buffer('_mean_gate', torch.tensor(0.0))
+        # 边界自适应放大标量
+        self.edge_alpha = nn.Parameter(torch.ones(1, rgb_c, 1, 1) * 0.1)
 
     def forward(self, x):
-        """
-        Args:
-            x: [rgb_feat, t_feat]
-                rgb_feat: [B, rgb_c, H, W] 待增强的RGB检测特征
-                t_feat:   [B, t_c, H_t, W_t] MFDA提取的浑浊度特征
-
-        Returns:
-            [B, rgb_c, H, W] 目标感知增强后的特征
-        """
         rgb_feat, t_feat = x
 
-        # ── 1. 空间尺寸对齐 ──
+        # 1. 空间多尺度对齐
         if rgb_feat.shape[2:] != t_feat.shape[2:]:
-            t_feat = F.interpolate(
-                t_feat, size=rgb_feat.shape[2:],
-                mode='bilinear', align_corners=False
-            )
+            t_feat = F.interpolate(t_feat, size=rgb_feat.shape[2:], mode='bilinear', align_corners=False)
 
-        # ── 2. 通道投影对齐(处理YOLO缩放导致的通道不匹配) ──
+        # 2. 通道规约对齐
         if t_feat.size(1) != self.t_c:
             if t_feat.size(1) > self.t_c:
-                # 输入通道过多 → 截取前 self.t_c 个通道
                 t_feat = t_feat[:, :self.t_c]
             else:
-                # 输入通道不足 → 零填充补齐
-                pad = torch.zeros(
-                    t_feat.size(0), self.t_c - t_feat.size(1),
-                    *t_feat.shape[2:], device=t_feat.device, dtype=t_feat.dtype
-                )
+                pad = torch.zeros(t_feat.size(0), self.t_c - t_feat.size(1), *t_feat.shape[2:], device=t_feat.device,
+                                  dtype=t_feat.dtype)
                 t_feat = torch.cat([t_feat, pad], dim=1)
 
-        # ── 3. 联合门控预测: gate = σ(Conv([rgb, t])) ──
-        # 同时编码目标语义与退化信息,关注"既退化又可能存在目标"的区域
-        joint_feat = torch.cat([rgb_feat, t_feat], dim=1)  # [B, rgb_c+t_c, H, W]
-        gate_map = self.gate_predictor(joint_feat)  # [B, 1, H, W]
+        # 3. 目标感知门控图预测
+        joint_feat = torch.cat([rgb_feat, t_feat], dim=1)
+        gate_map = self.gate_predictor(joint_feat)  # [B, rgb_c, H, W]
 
-        # 记录平均门控值(用于训练监控)
-        if self.training:
-            self._mean_gate = gate_map.detach().mean()
+        # 4. 提取纯净高频判别细节：detail = MWT(rgb) - rgb
+        enhanced = self.mwt(rgb_feat)
+        detail = enhanced - rgb_feat
 
-        # ── 4. 小波频率增强 ──
-        enhanced = self.mwt(rgb_feat)  # [B, rgb_c, H, W]
-
-        # ── 5. 高频残差注入 ──
-        # detail = MWT(rgb) - rgb: 仅保留小波变换新增的高频判别信息
-        # output = rgb + gate * detail: 自适应注入细节,不破坏低频语义
-        gate = torch.sigmoid(self.gate_gamma) * gate_map  # [B, 1, H, W]
-        detail = enhanced - rgb_feat  # [B, rgb_c, H, W] 高频残差
-        output = rgb_feat + gate * detail
+        # 5. 【核心修复】：引入残差放大因子，杜绝梯度消失
+        # 原版 output = rgb + gate * detail，在初期的 gate 极小，细节直接死掉
+        # 修复版：通过 1.0 + alpha * gate_map，赋予高频边缘至少 100% 的基线通过权，并自适应向上拉亮纹理响应
+        output = rgb_feat + (1.0 + self.edge_alpha * gate_map) * detail
 
         return output
 
 
 class frequent_block(nn.Module):
     """
-    多模态频域自适应融合块 (Target-Aware版本).
-
-    集成目标感知的小波增强与物理先验注入:
-    - A_inject: 全局色偏校正 (利用A特征)
-    - TurbidityGuidedMWT (TAWE): 目标感知小波增强 (联合rgb+t特征,
-      关注"既退化又可能存在目标"的区域,高频残差注入)
-    - MWT_CSP_V1_newSG: 级联小波增强 (无门控,避免双重抑制)
-    - t_inject: 浑浊度去雾 (利用t特征的物理大气光模型)
+    多模态频域自适应融合块 (修复解耦版)
+    解耦拓扑：将双重门控的串行链条彻底解耦，改回经典的 YOLO 级联多分支结构。
     """
 
     def __init__(self, c1, c2, e=0.5):
         super().__init__()
-        self.c = int(c2 * e)  # hidden channels
+        self.c = int(c2 * e)
         self.cv1 = Conv(c2, 2 * self.c, 1, 1)
         self.cv2 = Conv(5 * self.c, c2, 1)
         self.e = e
         self.c1 = c1
         self.c2 = c2
 
-        # 物理先验通道数 (与原始Concat布局一致: [RGB, t, A])
-        # t_block和A_block的通道数由YAML决定,不假设它们相等
-        self.t_channels = int(c2 * e)  # t_block输出的通道数 (= self.c)
-        self.a_channels = c1 - c2 - self.t_channels  # A_block输出的通道数
+        self.t_channels = int(c2 * e)
+        self.a_channels = c1 - c2 - self.t_channels
         if self.a_channels <= 0:
-            self.a_channels = self.c  # fallback
+            self.a_channels = self.c
 
+            # ── 核心修复点：重组计算管线，恢复物理物理模型的刚性 ──
         self.m = nn.ModuleList([
-            A_inject(self.c, self.a_channels),                            # 色偏全局校正
-            TurbidityGuidedMWT(self.c, self.t_channels, level=3),         # 退化引导小波增强 (单次门控)
-            MWT_CSP_V1_newSG(self.c, self.c, level=3, use_broken=False),  # 级联小波增强 (无门控, 避免双重抑制)
-            t_inject(self.c),                                              # 浑浊度物理去雾
+            A_inject(self.c, self.a_channels),  # 分支0：全局色偏校正
+            TurbidityGuidedMWT(self.c, self.t_channels, level=3),  # 分支1：目标感知小波细节补偿 (TAWE)
+            # 💡 将物理去雾分支恢复为原版的动态物理大气光模型，坚决不用 DCNv3 污染一阶线性公式
+            t_inject(self.c),
         ])
 
     def forward(self, x):
-        """Forward pass with target-aware wavelet enhancement."""
-        # 严格按Concat布局解耦: [RGB, t(浑浊度), A(色偏)]
         split_channels = [self.c2, self.t_channels, self.a_channels]
-        assert sum(split_channels) == x.size(1), \
-            f"Channel mismatch: {sum(split_channels)} != {x.size(1)}"
+        assert sum(split_channels) == x.size(1), f"Channel mismatch: {sum(split_channels)} != {x.size(1)}"
         rgb, t, A = torch.split(x, split_channels, dim=1)
 
+        # 初始投影分流
         y = list(self.cv1(rgb).chunk(2, 1))
 
-        # 多模态注入管线:
-        # m[0]: A → 全局色偏校正
-        # m[1]: [rgb,t] → TAWE 目标感知小波增强 (联合门控, 高频残差注入)
-        # m[2]: 级联小波增强 (无门控, 直接作用在m[1]输出上)
-        # m[3]: t → 浑浊度物理去雾
-        y.extend([self.m[0]([y[-1], A])])                        # A_inject: 色偏→通道级校正
-        y.extend([self.m[2](self.m[1]([y[-1], t]))])             # TAWE → 级联MWT (高频残差注入, 避免双重抑制)
-        y.extend([self.m[3]([y[-1], t])])                        # t_inject: t→大气光模型去雾
+        # ── 核心修复：拓扑解耦 ──
+        # 1. 提取色偏提纯特征
+        feat_A = self.m[0]([y[-1], A])
+
+        # 2. 注入目标感知小波细节（TAWE模块单独享有纯净的特征输入，杜绝二次门控压榨）
+        feat_MWT = self.m[1]([feat_A, t])
+
+        # 3. 物理大气光柔光去雾
+        feat_dehaz = self.m[2]([feat_MWT, t])
+
+        # 级联送回特征金字塔
+        y.extend([feat_A, feat_MWT, feat_dehaz])
 
         return self.cv2(torch.cat(y, 1))
     
