@@ -1,8 +1,9 @@
 # Ultralytics YOLO 🚀, AGPL-3.0 license
 # YOLO11 object detection model with P3-P5 outputs. For Usage examples see https://docs.ultralytics.com/tasks/detect
+# HyUOD: Physics-Coupled Frequency Dynamic Adaptation Network with E (Edge) guidance
 
 # Parameters
-ch: 9
+ch: 10  # 10-channel input: E(1ch @9) + A(3ch @0:3) + T(3ch @3:6) + RGB(3ch @6:9)
 nc: 80 # number of classes
 scales: # model compound scaling constants, i.e. 'model=yolo11n.yaml' will call yolo11.yaml with scale 'n'
   # [depth, width, max_channels]
@@ -12,61 +13,70 @@ scales: # model compound scaling constants, i.e. 'model=yolo11n.yaml' will call 
   l: [1.00, 1.00, 512] # summary: 631 layers, 25372160 parameters, 25372144 gradients, 87.6 GFLOPs
   x: [1.00, 1.50, 512] # summary: 631 layers, 56966176 parameters, 56966160 gradients, 196.0 GFLOPs
 
-# YOLO11n backbone
+# HyUOD backbone with E (Edge) guidance — 4-way physics-coupled fusion
 backbone:
   # [from, repeats, module, args]
-  - [-1, 1, Input_agent, []] 
-  - [0, 1, t_head, [64]] 
-  - [0, 1, A_head, [32]] 
-  - [0, 1, First_Conv, [64, 3, 2]] # 3-P1/2
+  - [-1, 1, Input_agent, []]            # 0: identity passthrough
+  - [0, 1, t_head, [64]]                # 1: T transmission head  (ch 3:6)
+  - [0, 1, A_head, [32]]                # 2: A atmospheric head  (ch 6:9)
+  - [0, 1, E_head, [32]]                # 3: E edge head         (ch 9)  ← NEW
+  - [0, 1, First_Conv, [64, 3, 2]]      # 4: P1/2
 
-  - [1, 1, t_block, [64]] # (256*0.25)
-  - [2, 1, A_block, [64, 1]] 
-  - [-3, 1, Conv, [128, 3, 2]] # 6-P2/4
-  - [-1, 2, C3k2, [256, False, 0.25]]
-  - [[-1, -4, -3], 1, Concat, [1]]
-  - [-1, 1, frequent_block, [256, 0.25]] # 9
+  # Stage P2/4
+  - [1, 1, t_block, [64]]               # 5
+  - [2, 1, A_block, [64, 1]]            # 6
+  - [3, 1, E_block, [32, 1]]            # 7  ← NEW
+  - [4, 1, Conv, [128, 3, 2]]           # 8  P2/4 (from First_Conv)
+  - [-1, 2, C3k2, [256, False, 0.25]]   # 9
+  - [[-1, -5, -4, -3], 1, Concat, [1]]  # 10 4-way: C3k2 + t_block + A_block + E_block
+  - [-1, 1, frequent_block, [256, 0.25, 32]]  # 11 +e_ch
 
-  - [-6, 1, t_block, [128]] # (512*0.25)
-  - [2, 1, A_block, [64, 2]] 
-  - [-3, 1, Conv, [256, 3, 2]] # 12-P3/8
-  - [-1, 2, C3k2, [512, False, 0.25]]
-  - [[-1, -4, -3], 1, Concat, [1]]
-  - [-1, 1, frequent_block, [512, 0.25]] # 15
+  # Stage P3/8
+  - [5, 1, t_block, [128]]              # 12 (from prev t_block)
+  - [2, 1, A_block, [64, 2]]            # 13
+  - [3, 1, E_block, [32, 2]]            # 14 ← NEW
+  - [11, 1, Conv, [256, 3, 2]]          # 15 P3/8 (from frequent_block)
+  - [-1, 2, C3k2, [512, False, 0.25]]  # 16
+  - [[-1, -5, -4, -3], 1, Concat, [1]]  # 17 4-way
+  - [-1, 1, frequent_block, [512, 0.25, 32]]  # 18
 
-  - [-6, 1, t_block, [256]] # (512*0.5)
-  - [2, 1, A_block, [64, 3]] 
-  - [-3, 1, Conv, [512, 3, 2]] # 18-P4/16
-  - [-1, 2, C3k2, [512, True]]
-  - [[-1, -4, -3], 1, Concat, [1]]
-  - [-1, 1, frequent_block, [512]] # 21
+  # Stage P4/16
+  - [12, 1, t_block, [256]]             # 19 (from prev t_block)
+  - [2, 1, A_block, [64, 3]]            # 20
+  - [3, 1, E_block, [32, 3]]            # 21 ← NEW
+  - [18, 1, Conv, [512, 3, 2]]          # 22 P4/16 (from frequent_block)
+  - [-1, 2, C3k2, [512, True]]          # 23
+  - [[-1, -5, -4, -3], 1, Concat, [1]]  # 24 4-way
+  - [-1, 1, frequent_block, [512, 0.5, 32]]   # 25
 
-  - [-6, 1, t_block, [512]] # (1024*0.5)
-  - [2, 1, A_block, [64, 4]] 
-  - [-3, 1, Conv, [1024, 3, 2]] # 24-P5/32
-  - [-1, 2, C3k2, [1024, True]]
-  - [[-1, -4, -3], 1, Concat, [1]]
-  - [-1, 1, frequent_block, [1024]] # 27
+  # Stage P5/32
+  - [19, 1, t_block, [512]]             # 26 (from prev t_block)
+  - [2, 1, A_block, [64, 4]]            # 27
+  - [3, 1, E_block, [32, 4]]            # 28 ← NEW
+  - [25, 1, Conv, [1024, 3, 2]]         # 29 P5/32 (from frequent_block)
+  - [-1, 2, C3k2, [1024, True]]         # 30
+  - [[-1, -5, -4, -3], 1, Concat, [1]]  # 31 4-way
+  - [-1, 1, frequent_block, [1024, 0.5, 32]]  # 32
 
-  - [-1, 1, SPPF, [1024, 5]] # 28
-  - [-1, 2, C2PSA, [1024]] # 29
+  - [-1, 1, SPPF, [1024, 5]]            # 33
+  - [-1, 2, C2PSA, [1024]]              # 34
 
-# YOLO11n head
+# YOLO11 head
 head:
-  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
-  - [[-1, 21], 1, Concat, [1]] # cat backbone P4
-  - [-1, 2, C3k2, [512, False]] # 32
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]   # 35
+  - [[-1, 25], 1, Concat, [1]]                    # 36 cat backbone P4 (frequent_block 25)
+  - [-1, 2, C3k2, [512, False]]                   # 37
 
-  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
-  - [[-1, 15], 1, Concat, [1]] # cat backbone P3
-  - [-1, 2, C3k2, [256, False]] # 35 (P3/8-small)
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]   # 38
+  - [[-1, 18], 1, Concat, [1]]                    # 39 cat backbone P3 (frequent_block 18)
+  - [-1, 2, C3k2, [256, False]]                   # 40 (P3/8-small)
 
-  - [-1, 1, Conv, [256, 3, 2]]
-  - [[-1, 32], 1, Concat, [1]] # cat head P4
-  - [-1, 2, C3k2, [512, False]] # 38 (P4/16-medium)
+  - [-1, 1, Conv, [256, 3, 2]]                    # 41
+  - [[-1, 37], 1, Concat, [1]]                    # 42 cat head P4
+  - [-1, 2, C3k2, [512, False]]                   # 43 (P4/16-medium)
 
-  - [-1, 1, Conv, [512, 3, 2]]
-  - [[-1, 29], 1, Concat, [1]] # cat head P5
-  - [-1, 2, C3k2, [1024, True]] # 41 (P5/32-large)
+  - [-1, 1, Conv, [512, 3, 2]]                    # 44
+  - [[-1, 34], 1, Concat, [1]]                    # 45 cat C2PSA
+  - [-1, 2, C3k2, [1024, True]]                   # 46 (P5/32-large)
 
-  - [[35, 38, 41], 1, Detect, [nc]] # Detect(P3, P4, P5)
+  - [[40, 43, 46], 1, Detect, [nc]]               # 47 Detect(P3, P4, P5)

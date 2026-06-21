@@ -70,6 +70,9 @@ from ultralytics.nn.modules import (
     First_Conv,
     t_block,
     A_block,
+    E_head,
+    E_block,
+    e_inject,
     C3k2_wcpm,
 )
 from ultralytics.utils import DEFAULT_CFG_DICT, DEFAULT_CFG_KEYS, LOGGER, colorstr, emojis, yaml_load
@@ -1145,6 +1148,9 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             First_Conv,
             t_block,
             A_block,
+            E_head,
+            E_block,
+            e_inject,
             C3k2_wcpm,
         }
     )

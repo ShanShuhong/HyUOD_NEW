@@ -217,6 +217,7 @@ class BaseDataset(Dataset):
         im, f, fn = self.ims[i], self.im_files[i], self.npy_files[i]
         it = f.replace("images", 't')
         ia = f.replace("images", 'a')
+        ie = f.replace("images", 'e')
         if im is None:  # not cached in RAM
             if fn.exists():  # load npy
                 try:
@@ -227,9 +228,15 @@ class BaseDataset(Dataset):
                     im = cv2.imread(f)  # BGR
             else:  # read image
                 im = cv2.imread(f)  # BGR
-                # if self.hyp.ch > 3: 
+                # if self.hyp.ch > 3:
                 im = cv2.merge((cv2.imread(it), im))
                 im = cv2.merge((cv2.imread(ia), im))
+                # Load E (edge map) as 10th channel — single-channel structural contour
+                e_img = cv2.imread(ie, cv2.IMREAD_GRAYSCALE)
+                if e_img is not None:
+                    if e_img.ndim == 2:
+                        e_img = e_img[..., np.newaxis]
+                    im = np.concatenate((im, e_img), axis=2)
             if im is None:
                 raise FileNotFoundError(f"Image Not Found {f}")
             

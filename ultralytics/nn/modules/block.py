@@ -1899,8 +1899,26 @@ class A_head(nn.Module):
         self.dyconv2 =DynamicConv(in_planes=int(c2/2), out_planes=c2, kernel_size=1, stride=1, padding=0, bias=False)
 
     def forward(self, x):
-        # a = torch.cat([x[:,:,:3,:],x[:,:,6:,:]],1) 
-        return self.dyconv2(self.dyconv1(self.down(x[:,6:,:,:])))
+        # a = torch.cat([x[:,:,:3,:],x[:,:,6:,:]],1)
+        return self.dyconv2(self.dyconv1(self.down(x[:,6:9,:,:])))
+
+class E_head(nn.Module):
+    """Edge head: processes 1-channel edge map E from input channel 9, extracts structural contour features."""
+
+    def __init__(self, c1, c2):
+        super(E_head, self).__init__()
+        self.down = nn.AvgPool2d(kernel_size=2, stride=2)
+        self.conv1 = nn.Conv2d(1, int(c2 / 2), kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(int(c2 / 2))
+        self.dyconv2 = DynamicConv(in_planes=int(c2 / 2), out_planes=c2, kernel_size=3, stride=1, padding=1, bias=False)
+        self.silu = nn.SiLU()
+
+    def forward(self, x):
+        e = x[:, 9:10, :, :]  # 1-channel edge map at channel index 9
+        e = self.down(e)
+        e = self.silu(self.bn1(self.conv1(e)))
+        return self.silu(self.dyconv2(e))
+
 
 class t_block(nn.Module):
     def __init__(self, c1, c2, k=3, s=1, p=1):
@@ -1932,6 +1950,21 @@ class A_block(nn.Module):
             x = F.interpolate(x, size=target_size, mode='nearest')
         x = self.upsample(self.dyconv1(x))
         return x
+
+
+class E_block(nn.Module):
+    """Edge block: downsamples E edge features from P1/2 to match each backbone stage resolution."""
+
+    def __init__(self, c1, c2, level, down=False, k=1, s=1, p=0):
+        super(E_block, self).__init__()
+        self.downsample = nn.AvgPool2d(kernel_size=2**level, stride=2**level)
+        self.dyconv1 = DynamicConv(in_planes=c1, out_planes=c2, kernel_size=k, stride=s, padding=p, bias=False)
+
+    def forward(self, x):
+        x = self.downsample(x)
+        x = self.dyconv1(x)
+        return x
+
 
 class MWT_CSP_V1_newSG(nn.Module):
     def __init__(self, c1, c2, level=3, k=1, s=1, agent_conv_1=False, p=None, g=1, d=1, act=True, *args, **kwargs):
@@ -2047,32 +2080,59 @@ class t_inject(nn.Module):
         J = ((1+self.alpha)*I-self.alpha*A)*attention*self.beta + x
         return J
 
-class frequent_block(nn.Module):
-    """Faster Implementation of CSP Bottleneck with 2 convolutions."""
 
-    def __init__(self, c1, c2, e=0.5):
+class e_inject(nn.Module):
+    """Edge injection: uses edge features as prompt to guide RGB feature extraction via Cross_DynamicConv."""
+
+    def __init__(self, c1, prompt_planes, k=3, s=1, p=1):
+        super(e_inject, self).__init__()
+        self.cdyconv1 = Cross_DynamicConv(
+            prompt_planes=prompt_planes, in_planes=c1, out_planes=c1, grounps=8, kernel_size=k, stride=s, padding=p, bias=False
+        )
+        self.cdyconv2 = Cross_DynamicConv(
+            prompt_planes=prompt_planes, in_planes=c1, out_planes=c1, grounps=8, kernel_size=k, stride=s, padding=p, bias=False
+        )
+        self.bn = nn.BatchNorm2d(c1)
+        self.silu = nn.SiLU()
+
+    def forward(self, x):
+        # x is [RGB_feature, E_feature]
+        RGB_f, E_f = x
+        x = self.cdyconv1(RGB_f, E_f)
+        x = self.cdyconv2(channel_shuffle(x, 8), E_f)
+        return self.silu(self.bn(x + RGB_f))
+
+
+class frequent_block(nn.Module):
+    """Faster Implementation of CSP Bottleneck with 2 convolutions. Supports RGB + T + A + E four-way fusion."""
+
+    def __init__(self, c1, c2, e=0.5, e_ch=32):
         super().__init__()
         self.c = int(c2 * e)  # hidden channels
         self.cv1 = Conv(c2, 2 * self.c, 1, 1)
-        self.cv2 = Conv(5 * self.c, c2, 1)  # optional act=FReLU(c2)
+        self.cv2 = Conv(6 * self.c, c2, 1)  # 6-way concat: chunk0 + e_inject + A_inject + MWT + MWT + t_inject
         self.e = e
         self.c1 = c1
         self.c2 = c2
+        self.e_ch = e_ch
         self.m = nn.ModuleList([
-            A_inject(self.c, c1-c2-int(c2*e)),
-            MWT_CSP_V1_newSG(self.c,self.c),
-            MWT_CSP_V1_newSG(self.c,self.c),
+            e_inject(self.c, e_ch),
+            A_inject(self.c, c1 - c2 - int(c2 * e) - e_ch),
+            MWT_CSP_V1_newSG(self.c, self.c),
+            MWT_CSP_V1_newSG(self.c, self.c),
             t_inject(self.c),
         ])
+
     def forward(self, x):
-        """Forward pass through C2f layer."""
-        split_channels = [self.c2,int(self.c2*self.e), self.c1-self.c2-int(self.c2*self.e)]
-        assert sum(split_channels) == x.size(1)
-        rgb, t, A =  torch.split(x, split_channels, dim=1)
+        """Forward pass through C2f layer with E→A→MWT→MWT→T fusion chain."""
+        split_channels = [self.c2, int(self.c2 * self.e), self.c1 - self.c2 - int(self.c2 * self.e) - self.e_ch, self.e_ch]
+        assert sum(split_channels) == x.size(1), f"Split mismatch: {sum(split_channels)} vs {x.size(1)}"
+        rgb, t, A, E = torch.split(x, split_channels, dim=1)
         y = list(self.cv1(rgb).chunk(2, 1))
-        y.extend([self.m[0]([y[-1],A])])
-        y.extend([self.m[2](self.m[1](y[-1]))])
-        y.extend([self.m[3]([y[-1],t])])
+        y.extend([self.m[0]([y[-1], E])])           # e_inject: edge-guided structural modulation
+        y.extend([self.m[1]([y[-1], A])])           # A_inject: atmospheric light modulation
+        y.extend([self.m[3](self.m[2](y[-1]))])     # MWT_CSP × 2: wavelet transform refinement
+        y.extend([self.m[4]([y[-1], t])])           # t_inject: transmission-guided attention
         return self.cv2(torch.cat(y, 1))
     
 class DynamicConv(nn.Module):

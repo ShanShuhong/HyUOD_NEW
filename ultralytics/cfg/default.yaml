@@ -2,7 +2,7 @@
 
 # Global configuration YAML with settings and hyperparameters for YOLO training, validation, prediction and export
 # For documentation see https://docs.ultralytics.com/usage/cfg/
-ch: 9  # 这是我们自己定义的输入通道数，如果为6则意味着输入为（RGB+IR），为3则意味着输入为单模态（RGB或IR）
+ch: 10  # 这是我们自己定义的输入通道数，10通道为 E(1ch边缘)+A(3ch大气光)+T(3ch传输图)+RGB(3ch)
 task: detect # (str) YOLO task, i.e. detect, segment, classify, pose, obb
 mode: train # (str) YOLO mode, i.e. train, val, predict, export, track, benchmark
 

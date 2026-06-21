@@ -1,13 +1,9 @@
-
 import os
 import cv2
 import numpy as np
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from skimage.util.shape import view_as_windows
 import argparse
-import time
-
 
 
 def dark_channel(img):
@@ -24,41 +20,12 @@ def dark_channel(img):
     dc_img = cv2.erode(min_img,kernel)
     return dc_img
 
-def get_atmo(img, percent = 0.001):
-    mean_perpix = np.mean(img, axis = 2).reshape(-1)
-    mean_topper = mean_perpix[:int(img.shape[0] * img.shape[1] * percent)]
-    return np.mean(mean_topper)
 
 def get_trans(img, atom, w = 0.95):
     x = img / atom
     t = 1 - w * dark_channel(x)
     return t
 
-def guided_filter(p, i, r, e):
-    """
-    :param p: input image
-    :param i: guidance image
-    :param r: radius
-    :param e: regularization
-    :return: filtering output q
-    """
-    #1
-    mean_I = cv2.boxFilter(i, cv2.CV_64F, (r, r))
-    mean_p = cv2.boxFilter(p, cv2.CV_64F, (r, r))
-    corr_I = cv2.boxFilter(i * i, cv2.CV_64F, (r, r))
-    corr_Ip = cv2.boxFilter(i * p, cv2.CV_64F, (r, r))
-    #2
-    var_I = corr_I - mean_I * mean_I
-    cov_Ip = corr_Ip - mean_I * mean_p
-    #3
-    a = cov_Ip / (var_I + e)
-    b = mean_p - a * mean_I
-    #4
-    mean_a = cv2.boxFilter(a, cv2.CV_64F, (r, r))
-    mean_b = cv2.boxFilter(b, cv2.CV_64F, (r, r))
-    #5
-    q = mean_a * i + mean_b
-    return q
 
 def calculate_eta_ratios(t_b, a, lambda_r=700, lambda_g=550, lambda_b=450):
     numerator_r = (-0.00113 * lambda_r + 1.62517) * a[0]#A_b
@@ -112,64 +79,87 @@ def calculate_airlight(image, window_size=(25, 25)):
     airlight = np.mean(top_rgb_values, axis=0)
     
     return tuple(airlight)
-        
-def dehaze_image(image_path, t_save_path, a_save_path,img_save_path=None):
+
+
+def extract_edge_map(img_bgr):
+    """
+    💡【全新引入】：自适应水下高频轮廓/边缘提取算子（Edge Map, E）
+    设计逻辑：
+    1. 使用双边滤波器（Bilateral Filter）在保持高频生物边界的同时，滤除低频水体散射和悬浮悬浮颗粒噪声。
+    2. 计算自适应 Canny 阈值，精准捕捉不同能见度下的刚性结构特征。
+    """
+    # 1. 双边滤波保边降噪
+    filtered = cv2.bilateralFilter(img_bgr, d=7, sigmaColor=35, sigmaSpace=35)
+    gray = cv2.cvtColor(filtered, cv2.COLOR_BGR2GRAY)
+
+    # 2. 计算自适应大津阈值基准
+    v = np.median(gray)
+    sigma = 0.33
+    lower = int(max(0, (1.0 - sigma) * v))
+    upper = int(min(255, (1.0 + sigma) * v))
+
+    # 3. 提取边缘轮廓
+    edge = cv2.Canny(gray, lower, upper)
+
+    # 4. 规范化为单通道特征图图 [0, 255]
+    return edge
+
+
+def dehaze_image(image_path, t_save_path, a_save_path, e_save_path, img_save_path=None):
+    """
+    追加 e_save_path 用来无损存放边缘特征图 E
+    """
     im = cv2.imread(image_path)
-    # ratio = 640/im.shape[1]
-    # im = cv2.resize(im,(640,int(im.shape[0]*ratio)))
+    if im is None:
+        return
+
     img = im.astype('float64') / 255
-    img_gray = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY).astype('float64') / 255
+
+    # 1. 物理退化先验计算 (T 和 A)
     atom = calculate_airlight(img)
     trans = get_trans(img, atom)
     trans = np.clip(trans, a_min=0.1, a_max=0.90)
     trans = calculate_eta_ratios(trans, atom)
+
+    # 2. 💡 执行自适应边缘轮廓特征提取 (E)
+    edge_map = extract_edge_map(im)
+
+    # 3. 生成物理对齐保存路径
     t_save = os.path.join(t_save_path, os.path.basename(image_path))
     a_save = os.path.join(a_save_path, os.path.basename(image_path))
-    atom = np.full((im.shape[0], im.shape[1], 3), np.multiply(atom, 255), dtype=np.uint8)
-    if img_save_path != None:
-        img_save = os.path.join(img_save_path, os.path.basename(image_path))
-        base_name = os.path.basename(image_path)
-        name, ext = os.path.splitext(base_name)  
-        stro_img_save = os.path.join(img_save_path,name+'_strong'+ext)
-        stro_trans = np.power(trans, 0.5)
-        stro_img = stro_trans * im +(1-stro_trans) * atom
-        
-        fake_stro_img_save = os.path.join(img_save_path,name+'_fakestrong'+ext)
-        fake_stro_trans = np.mean(stro_trans)
-        fake_stro_img = fake_stro_trans * im +(1-fake_stro_trans) * atom
+    e_save = os.path.join(e_save_path, os.path.basename(image_path))
 
+    atom_img = np.full((im.shape[0], im.shape[1], 3), np.multiply(atom, 255), dtype=np.uint8)
+
+    if img_save_path is not None:
+        img_save = os.path.join(img_save_path, os.path.basename(image_path))
         cv2.imwrite(img_save, im)
-        cv2.imwrite(stro_img_save, stro_img)
-        cv2.imwrite(fake_stro_img_save, fake_stro_img)
-    cv2.imwrite(t_save, trans * 255)
-    cv2.imwrite(a_save, atom)
-        
-def dehaze_V2(originPath, t_save_path, a_save_path):
-    '''originaPath:文件夹的路径，图片上一级
-       savePath:同理'''
-    image_paths = [os.path.join(originPath, image_name) for image_name in os.listdir(originPath)]
-    
+
+    # 4. 物理数据无损落盘
+    cv2.imwrite(t_save, trans * 255)  # 保存透射率 T [B, 3, H, W]
+    cv2.imwrite(a_save, atom_img)  # 保存全局大气光 A [B, 3, H, W]
+    cv2.imwrite(e_save, edge_map)  # 保存刚性边缘图 E [B, 1, H, W]
+
+
+def dehaze_V2(originPath, t_save_path, a_save_path, e_save_path):
+    image_names = os.listdir(originPath)
+    image_paths = [os.path.join(originPath, image_name) for image_name in image_names if
+                   image_name.lower().endswith(('.png', '.jpg', '.jpeg'))]
+
     with ThreadPoolExecutor(max_workers=8) as executor:
-        futures = [executor.submit(dehaze_image, image_path, t_save_path, a_save_path) for image_path in image_paths]
-        
+        futures = [executor.submit(dehaze_image, image_path, t_save_path, a_save_path, e_save_path) for image_path in
+                   image_paths]
         for future in tqdm(as_completed(futures), total=len(futures)):
             future.result()
 
 
 if __name__ == "__main__":
-    # 1. Initialize the command-line argument parser
-    parser = argparse.ArgumentParser(description="Script to batch process dehazing for train and test datasets.")
-    
-    # 2. Add required command-line arguments
-    # First argument: Main input directory for images
-    parser.add_argument("input_dir", type=str, help="Main input path for images, e.g., /opt/data/private/UOD/DUO/images")
-    # Second argument: Main output directory
-    parser.add_argument("output_dir", type=str, help="Main output path, e.g., /opt/data/private/UOD/DUO/")
-    
-    # 3. Parse the arguments
+    parser = argparse.ArgumentParser(description="Script to batch process UOD physical priors (T, A, E) for datasets.")
+    parser.add_argument("input_dir", type=str, help="Main input path for images")
+    parser.add_argument("output_dir", type=str, help="Main output path")
     args = parser.parse_args()
 
-    # 4. Define the list of folder splits to process in one go
+    # 自动处理 test 和 train 两个子文件夹 splits
     splits = ["test", "train"]
 
     for split in splits:
@@ -182,17 +172,18 @@ if __name__ == "__main__":
         
         # e.g., /opt/data/private/UOD/DUO/a/test
         out_a_path = os.path.join(args.output_dir, "a", split)
-        
-        # Automatically create output directories (if they don't exist) to prevent errors
+        out_e_path = os.path.join(args.output_dir, "e", split)  # 💡 自动创建物理边缘保存主轴
+
         os.makedirs(out_t_path, exist_ok=True)
         os.makedirs(out_a_path, exist_ok=True)
-        
+        os.makedirs(out_e_path, exist_ok=True)
+
         print(f"Processing '{split}' data...")
         print(f" -> Input image path: {img_path}")
         print(f" -> Output T path: {out_t_path}")
         print(f" -> Output A path: {out_a_path}")
-        
-        # Call your processing function
-        dehaze_V2(img_path, out_t_path, out_a_path)
-        
-    print("All data processing complete!")
+        print(f" -> Output E path: {out_e_path}")
+
+        dehaze_V2(img_path, out_t_path, out_a_path, out_e_path)
+
+    print("All data preprocessing complete! T, A, and E maps are perfectly aligned!")

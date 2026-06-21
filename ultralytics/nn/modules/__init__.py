@@ -64,6 +64,9 @@ from .block import (
     t_block,
     A_block,
     frequent_block,
+    E_head,
+    E_block,
+    e_inject,
     C3k2_wcpm,
 )
 from .conv import (
@@ -177,5 +180,8 @@ __all__ = (
     "A_block",
     "First_Conv",
     "frequent_block",
+    "E_head",
+    "E_block",
+    "e_inject",
     "C3k2_wcpm",
 )
