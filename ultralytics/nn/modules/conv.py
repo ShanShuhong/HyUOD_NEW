@@ -6,6 +6,7 @@ import math
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 __all__ = (
     "Conv",
@@ -717,13 +718,11 @@ class Index(nn.Module):
 
 class First_Conv(nn.Module):
     """
-    Standard convolution module with batch normalization and activation.
+    RGB stem with an internal Sobel-guided edge branch.
 
-    Attributes:
-        conv (nn.Conv2d): Convolutional layer.
-        bn (nn.BatchNorm2d): Batch normalization layer.
-        act (nn.Module): Activation function layer.
-        default_act (nn.Module): Default activation function (SiLU).
+    The module keeps the original external behavior of consuming only the first
+    three RGB channels from HYUOD's 9-channel input, while injecting a fixed
+    edge prior before activation.
     """
 
     default_act = nn.SiLU()  # default activation
@@ -743,9 +742,24 @@ class First_Conv(nn.Module):
             act (bool | nn.Module): Activation function.
         """
         super().__init__()
-        self.conv = nn.Conv2d(3, c2, k, s, autopad(k, p, d), groups=g, dilation=d, bias=False)
+        pad = autopad(k, p, d)
+        self.conv = nn.Conv2d(3, c2, k, s, pad, groups=g, dilation=d, bias=False)
         self.bn = nn.BatchNorm2d(c2)
+        self.edge_conv = nn.Conv2d(1, c2, k, s, pad, dilation=d, bias=False)
+        self.edge_gate = nn.Conv2d(c2, c2, 1, 1, 0, bias=True)
         self.act = self.default_act if act is True else act if isinstance(act, nn.Module) else nn.Identity()
+
+        sobel_x = torch.tensor([[1.0, 0.0, -1.0], [2.0, 0.0, -2.0], [1.0, 0.0, -1.0]], dtype=torch.float32)
+        sobel_y = torch.tensor([[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]], dtype=torch.float32)
+        self.register_buffer("sobel_x", sobel_x.view(1, 1, 3, 3).repeat(3, 1, 1, 1), persistent=False)
+        self.register_buffer("sobel_y", sobel_y.view(1, 1, 3, 3).repeat(3, 1, 1, 1), persistent=False)
+
+    def _edge_guidance(self, rgb):
+        """Compute a single-channel Sobel magnitude map from RGB input."""
+        grad_x = F.conv2d(rgb, self.sobel_x, padding=1, groups=3)
+        grad_y = F.conv2d(rgb, self.sobel_y, padding=1, groups=3)
+        edge = torch.sqrt(grad_x.pow(2) + grad_y.pow(2) + 1e-6)
+        return edge.mean(dim=1, keepdim=True)
 
     def forward(self, x):
         """
@@ -757,8 +771,11 @@ class First_Conv(nn.Module):
         Returns:
             (torch.Tensor): Output tensor.
         """
-        x = x[:,:3,:,:]
-        return self.act(self.bn(self.conv(x)))
+        rgb = x[:, :3, :, :]
+        rgb_feat = self.bn(self.conv(rgb))
+        edge_feat = self.edge_conv(self._edge_guidance(rgb))
+        edge_gate = torch.sigmoid(self.edge_gate(rgb_feat))
+        return self.act(rgb_feat + edge_gate * edge_feat)
 
     def forward_fuse(self, x):
         """
@@ -770,8 +787,11 @@ class First_Conv(nn.Module):
         Returns:
             (torch.Tensor): Output tensor.
         """
-        x = x[:,:3,:,:]
-        return self.act(self.conv(x))
+        rgb = x[:, :3, :, :]
+        rgb_feat = self.conv(rgb)
+        edge_feat = self.edge_conv(self._edge_guidance(rgb))
+        edge_gate = torch.sigmoid(self.edge_gate(rgb_feat))
+        return self.act(rgb_feat + edge_gate * edge_feat)
 '''
 from .ops_dcnv3.modules import DCNv3,DCNv3_pytorch
 

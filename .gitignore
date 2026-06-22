@@ -8,7 +8,6 @@ __pycache__/
 # Dataset
 dataset_root/
 runs/
-test_yaml/
 
 # Model
 *.pt

@@ -1,0 +1,18 @@
+path: /home/admin1/xsworkspace/HyUOD/dataset_root/  # 使用绝对路径更稳妥
+train: images/train 
+val: images/test 
+test: images/test
+
+# 关键：添加多分量路径（如果您的代码逻辑支持读取这些键值）
+train_t: t/train
+train_a: a/train
+val_t: t/test
+val_a: a/test
+
+
+nc: 4  # 如果您确定数据集只有 4 类，请保持 4
+names:
+  0: holothurian
+  1: echinus
+  2: scallop
+  3: starfish
