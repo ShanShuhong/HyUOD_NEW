@@ -2047,6 +2047,29 @@ class t_inject(nn.Module):
         J = ((1+self.alpha)*I-self.alpha*A)*attention*self.beta + x
         return J
 
+class EdgeGuideInject(nn.Module):
+    def __init__(self, rgb_channels, hidden_channels):
+        super().__init__()
+        self.rgb_reduce = nn.Conv2d(rgb_channels, 1, 1, 1, bias=False)
+        self.edge_proj = Conv(1, hidden_channels, 3, 1)
+        self.edge_gate = nn.Conv2d(hidden_channels, hidden_channels, 1, 1, 0, bias=True)
+        self.alpha = nn.Parameter(torch.zeros((1, hidden_channels, 1, 1)))
+
+        sobel_x = torch.tensor([[1.0, 0.0, -1.0], [2.0, 0.0, -2.0], [1.0, 0.0, -1.0]], dtype=torch.float32)
+        sobel_y = torch.tensor([[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]], dtype=torch.float32)
+        self.register_buffer("sobel_x", sobel_x.view(1, 1, 3, 3), persistent=False)
+        self.register_buffer("sobel_y", sobel_y.view(1, 1, 3, 3), persistent=False)
+
+    def forward(self, rgb, x):
+        edge_base = self.rgb_reduce(rgb)
+        grad_x = F.conv2d(edge_base, self.sobel_x, padding=1)
+        grad_y = F.conv2d(edge_base, self.sobel_y, padding=1)
+        edge_map = torch.sqrt(grad_x.pow(2) + grad_y.pow(2) + 1e-6)
+        edge_feat = self.edge_proj(edge_map)
+        edge_gate = torch.sigmoid(self.edge_gate(edge_feat))
+        return x + self.alpha * edge_gate * edge_feat
+
+
 class frequent_block(nn.Module):
     """Faster Implementation of CSP Bottleneck with 2 convolutions."""
 
@@ -2058,21 +2081,25 @@ class frequent_block(nn.Module):
         self.e = e
         self.c1 = c1
         self.c2 = c2
+        self.edge_inject = EdgeGuideInject(c2, self.c)
         self.m = nn.ModuleList([
             A_inject(self.c, c1-c2-int(c2*e)),
             MWT_CSP_V1_newSG(self.c,self.c),
             MWT_CSP_V1_newSG(self.c,self.c),
             t_inject(self.c),
         ])
+
     def forward(self, x):
         """Forward pass through C2f layer."""
-        split_channels = [self.c2,int(self.c2*self.e), self.c1-self.c2-int(self.c2*self.e)]
+        split_channels = [self.c2, int(self.c2 * self.e), self.c1 - self.c2 - int(self.c2 * self.e)]
         assert sum(split_channels) == x.size(1)
-        rgb, t, A =  torch.split(x, split_channels, dim=1)
+        rgb, t, A = torch.split(x, split_channels, dim=1)
         y = list(self.cv1(rgb).chunk(2, 1))
-        y.extend([self.m[0]([y[-1],A])])
-        y.extend([self.m[2](self.m[1](y[-1]))])
-        y.extend([self.m[3]([y[-1],t])])
+        a_guided = self.m[0]([y[-1], A])
+        y.append(a_guided)
+        wavelet_input = self.edge_inject(rgb, y[-1])
+        y.append(self.m[2](self.m[1](wavelet_input)))
+        y.append(self.m[3]([y[-1], t]))
         return self.cv2(torch.cat(y, 1))
     
 class DynamicConv(nn.Module):
