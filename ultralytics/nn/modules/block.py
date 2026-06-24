@@ -2081,7 +2081,7 @@ class frequent_block(nn.Module):
         self.e = e
         self.c1 = c1
         self.c2 = c2
-        self.use_edge_inject = c2 == 256 and abs(e - 0.25) < 1e-6
+        self.use_edge_inject = abs(e - 0.25) < 1e-6 and c2 in (128, 256)
         self.edge_inject = EdgeGuideInject(c2, self.c) if self.use_edge_inject else None
         self.m = nn.ModuleList([
             A_inject(self.c, c1-c2-int(c2*e)),
