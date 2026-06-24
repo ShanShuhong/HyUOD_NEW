@@ -2081,7 +2081,8 @@ class frequent_block(nn.Module):
         self.e = e
         self.c1 = c1
         self.c2 = c2
-        self.edge_inject = EdgeGuideInject(c2, self.c)
+        self.use_edge_inject = c2 == 256 and abs(e - 0.25) < 1e-6
+        self.edge_inject = EdgeGuideInject(c2, self.c) if self.use_edge_inject else None
         self.m = nn.ModuleList([
             A_inject(self.c, c1-c2-int(c2*e)),
             MWT_CSP_V1_newSG(self.c,self.c),
@@ -2097,7 +2098,7 @@ class frequent_block(nn.Module):
         y = list(self.cv1(rgb).chunk(2, 1))
         a_guided = self.m[0]([y[-1], A])
         y.append(a_guided)
-        wavelet_input = self.edge_inject(rgb, y[-1])
+        wavelet_input = self.edge_inject(rgb, y[-1]) if self.use_edge_inject else y[-1]
         y.append(self.m[2](self.m[1](wavelet_input)))
         y.append(self.m[3]([y[-1], t]))
         return self.cv2(torch.cat(y, 1))
