@@ -71,6 +71,7 @@ from ultralytics.nn.modules import (
     t_block,
     A_block,
     C3k2_wcpm,
+    LPM_P4_lite,
 )
 from ultralytics.utils import DEFAULT_CFG_DICT, DEFAULT_CFG_KEYS, LOGGER, colorstr, emojis, yaml_load
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
@@ -1223,6 +1224,12 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
                 m.legacy = legacy
         elif m is RTDETRDecoder:  # special case, channels arg must be passed in index 1
             args.insert(1, [ch[x] for x in f])
+        elif m is LPM_P4_lite:
+            c3, c4, c5 = [ch[x] for x in f]
+            c2 = args[0] if args else c4
+            if c2 != nc:
+                c2 = make_divisible(min(c2, max_channels) * width, 8)
+            args = [c3, c4, c5, c2, *args[1:]]
         elif m is CBLinear:
             c2 = args[0]
             c1 = ch[f]

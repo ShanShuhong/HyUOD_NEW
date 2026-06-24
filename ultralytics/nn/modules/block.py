@@ -60,6 +60,7 @@ __all__ = (
     "A_block",
     "frequent_block",
     "C3k2_wcpm",
+    "LPM_P4_lite",
 )
 
 
@@ -2209,6 +2210,42 @@ def channel_shuffle(x, groups):
    x = torch.transpose(x, 1, 2).contiguous()
    x = x.view(batchsize, -1, height, width)
    return x
+
+class LPM_P4_lite(nn.Module):
+    """Lightweight multi-scale P4 refinement block.
+
+    Takes [P3, P4, P5] features, aligns them to the P4 resolution,
+    fuses them with lightweight convolutions, and returns a refined P4.
+    """
+
+    def __init__(self, c3, c4, c5, c2=None, mid_ratio=0.5):
+        super().__init__()
+        c2 = c4 if c2 is None else c2
+        cm = max(32, int(c2 * mid_ratio))
+
+        self.p3_proj = Conv(c3, cm, 1, 1)
+        self.p3_down = Conv(cm, cm, 3, 2)
+        self.p4_proj = Conv(c4, cm, 1, 1)
+        self.p5_proj = Conv(c5, cm, 1, 1)
+
+        self.fuse = Conv(cm * 3, c2, 1, 1)
+        self.mix = LightConv(c2, c2, 3, act=nn.SiLU())
+        self.out = Conv(c2, c2, 3, 1)
+        self.shortcut = Conv(c4, c2, 1, 1, act=False) if c4 != c2 else nn.Identity()
+
+    def forward(self, x):
+        if not isinstance(x, (list, tuple)) or len(x) != 3:
+            raise ValueError(f"LPM_P4_lite expects [P3, P4, P5], got {type(x)} with len={len(x) if isinstance(x, (list, tuple)) else 'n/a'}")
+
+        p3, p4, p5 = x
+        p3 = self.p3_down(self.p3_proj(p3))
+        p4_mid = self.p4_proj(p4)
+        p5 = F.interpolate(self.p5_proj(p5), size=p4.shape[-2:], mode="nearest")
+
+        y = self.fuse(torch.cat((p3, p4_mid, p5), dim=1))
+        y = self.out(self.mix(y))
+        return y + self.shortcut(p4)
+
 
 class C3k2_wcpm(nn.Module):
     """Faster Implementation of CSP Bottleneck with 2 convolutions."""
