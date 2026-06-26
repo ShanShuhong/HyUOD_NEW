@@ -60,6 +60,7 @@ __all__ = (
     "A_block",
     "frequent_block",
     "C3k2_wcpm",
+    "LPM_P3P4_lite",
 )
 
 
@@ -2209,6 +2210,57 @@ def channel_shuffle(x, groups):
    x = torch.transpose(x, 1, 2).contiguous()
    x = x.view(batchsize, -1, height, width)
    return x
+
+
+class LPM_P3P4_lite(nn.Module):
+    """Lightweight multi-scale refinement block for P3 and P4.
+
+    It consumes [P3, P4, P5], refines P4 using all three scales, then
+    feeds the refined P4 back to refine P3. The module returns
+    [P3_ref, P4_ref] for Detect.
+    """
+
+    def __init__(self, c3, c4, c5, c3_out=None, c4_out=None, mid_ratio=0.5):
+        super().__init__()
+        c3_out = c3 if c3_out is None else c3_out
+        c4_out = c4 if c4_out is None else c4_out
+        cm = max(32, int(max(c3_out, c4_out) * mid_ratio))
+
+        self.p3_to_p4 = Conv(c3, cm, 3, 2)
+        self.p4_proj = Conv(c4, cm, 1, 1)
+        self.p5_proj = Conv(c5, cm, 1, 1)
+
+        self.p4_fuse = Conv(cm * 3, c4_out, 1, 1)
+        self.p4_mix = LightConv(c4_out, c4_out, 3, act=nn.SiLU())
+        self.p4_out = Conv(c4_out, c4_out, 3, 1)
+        self.p4_shortcut = Conv(c4, c4_out, 1, 1, act=False) if c4 != c4_out else nn.Identity()
+
+        self.p3_proj = Conv(c3, cm, 1, 1)
+        self.p4_to_p3 = Conv(c4_out, cm, 1, 1)
+        self.p5_to_p3 = Conv(c5, cm, 1, 1)
+
+        self.p3_fuse = Conv(cm * 3, c3_out, 1, 1)
+        self.p3_mix = LightConv(c3_out, c3_out, 3, act=nn.SiLU())
+        self.p3_out = Conv(c3_out, c3_out, 3, 1)
+        self.p3_shortcut = Conv(c3, c3_out, 1, 1, act=False) if c3 != c3_out else nn.Identity()
+
+    def forward(self, x):
+        if not isinstance(x, (list, tuple)) or len(x) != 3:
+            raise ValueError(f"LPM_P3P4_lite expects [P3, P4, P5], got {type(x)} with len={len(x) if isinstance(x, (list, tuple)) else 'n/a'}")
+
+        p3, p4, p5 = x
+
+        p3_down = self.p3_to_p4(p3)
+        p4_mid = self.p4_proj(p4)
+        p5_up = F.interpolate(self.p5_proj(p5), size=p4.shape[-2:], mode="nearest")
+        p4_ref = self.p4_out(self.p4_mix(self.p4_fuse(torch.cat((p3_down, p4_mid, p5_up), dim=1)))) + self.p4_shortcut(p4)
+
+        p3_mid = self.p3_proj(p3)
+        p4_up = F.interpolate(self.p4_to_p3(p4_ref), size=p3.shape[-2:], mode="nearest")
+        p5_up_to_p3 = F.interpolate(self.p5_to_p3(p5), size=p3.shape[-2:], mode="nearest")
+        p3_ref = self.p3_out(self.p3_mix(self.p3_fuse(torch.cat((p3_mid, p4_up, p5_up_to_p3), dim=1)))) + self.p3_shortcut(p3)
+
+        return [p3_ref, p4_ref]
 
 class C3k2_wcpm(nn.Module):
     """Faster Implementation of CSP Bottleneck with 2 convolutions."""

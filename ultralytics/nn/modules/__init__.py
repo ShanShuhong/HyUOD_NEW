@@ -65,6 +65,7 @@ from .block import (
     A_block,
     frequent_block,
     C3k2_wcpm,
+    LPM_P3P4_lite,
 )
 from .conv import (
     CBAM,
@@ -178,4 +179,5 @@ __all__ = (
     "First_Conv",
     "frequent_block",
     "C3k2_wcpm",
+    "LPM_P3P4_lite",
 )

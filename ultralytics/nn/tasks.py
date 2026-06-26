@@ -71,6 +71,7 @@ from ultralytics.nn.modules import (
     t_block,
     A_block,
     C3k2_wcpm,
+    LPM_P3P4_lite,
 )
 from ultralytics.utils import DEFAULT_CFG_DICT, DEFAULT_CFG_KEYS, LOGGER, colorstr, emojis, yaml_load
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
@@ -1223,6 +1224,16 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
                 m.legacy = legacy
         elif m is RTDETRDecoder:  # special case, channels arg must be passed in index 1
             args.insert(1, [ch[x] for x in f])
+        elif m is LPM_P3P4_lite:
+            c3, c4, c5 = [ch[x] for x in f]
+            c3_out = args[0] if args else c3
+            c4_out = args[1] if len(args) > 1 else c4
+            if c3_out != nc:
+                c3_out = make_divisible(min(c3_out, max_channels) * width, 8)
+            if c4_out != nc:
+                c4_out = make_divisible(min(c4_out, max_channels) * width, 8)
+            c2 = [c3_out, c4_out]
+            args = [c3, c4, c5, c3_out, c4_out, *args[2:]]
         elif m is CBLinear:
             c2 = args[0]
             c1 = ch[f]
@@ -1230,9 +1241,14 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
         elif m is CBFuse:
             c2 = ch[f[-1]]
         elif m in frozenset({TorchVision, Index}):
-            c2 = args[0]
-            c1 = ch[f]
-            args = [*args[1:]]
+            if m is Index and isinstance(ch[f], list):
+                c2 = ch[f][args[1]]
+                c1 = ch[f]
+                args = [args[1]]
+            else:
+                c2 = args[0]
+                c1 = ch[f]
+                args = [*args[1:]]
         else:
             c2 = ch[f]
 
