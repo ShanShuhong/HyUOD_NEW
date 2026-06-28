@@ -54,6 +54,12 @@ max_det: 300 # (int) maximum number of detections per image
 half: False # (bool) use half precision (FP16)
 dnn: False # (bool) use OpenCV DNN for ONNX inference
 plots: True # (bool) save plots and images during train/val
+actm: False # (bool) enable adaptive confidence thresholding during validation postprocess
+actm_gamma: 0.001 # (float) score statistic scale factor for ACTM
+actm_beta: 0.1 # (float) bias / EMA smoothing factor for ACTM threshold updates
+actm_min_conf: 0.001 # (float) lower clamp for ACTM dynamic confidence threshold
+actm_max_conf: 0.05 # (float) upper clamp for ACTM dynamic confidence threshold
+actm_log: False # (bool) log ACTM threshold updates during validation
 
 # Predict settings -----------------------------------------------------------------------------------------------------
 source: # (str, optional) source directory for images or videos

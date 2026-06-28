@@ -60,6 +60,7 @@ __all__ = (
     "A_block",
     "frequent_block",
     "C3k2_wcpm",
+    "EdgeGuideInject",
 )
 
 
@@ -2047,6 +2048,23 @@ class t_inject(nn.Module):
         J = ((1+self.alpha)*I-self.alpha*A)*attention*self.beta + x
         return J
 
+
+class EdgeGuideInject(nn.Module):
+    def __init__(self, c1, k=3, s=1, p=1):
+        super().__init__()
+        self.edge_proj = Conv(1, c1, 1, 1)
+        self.edge_gate = nn.Conv2d(c1, c1, 1, 1, 0, bias=True)
+        self.bn = nn.BatchNorm2d(c1)
+        self.silu = nn.SiLU()
+        self.alpha = nn.Parameter(torch.zeros((1, c1, 1, 1)))
+
+    def forward(self, x):
+        rgb_feat, edge = x
+        edge_feat = self.edge_proj(edge)
+        edge_gate = torch.sigmoid(self.edge_gate(edge_feat))
+        return self.silu(self.bn(rgb_feat + self.alpha * edge_gate * edge_feat))
+
+
 class frequent_block(nn.Module):
     """Faster Implementation of CSP Bottleneck with 2 convolutions."""
 
@@ -2058,18 +2076,32 @@ class frequent_block(nn.Module):
         self.e = e
         self.c1 = c1
         self.c2 = c2
+        self.edge_inject = EdgeGuideInject(self.c)
+        sobel_x = torch.tensor([[1.0, 0.0, -1.0], [2.0, 0.0, -2.0], [1.0, 0.0, -1.0]], dtype=torch.float32)
+        sobel_y = torch.tensor([[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]], dtype=torch.float32)
+        self.register_buffer("sobel_x", sobel_x.view(1, 1, 3, 3), persistent=False)
+        self.register_buffer("sobel_y", sobel_y.view(1, 1, 3, 3), persistent=False)
         self.m = nn.ModuleList([
             A_inject(self.c, c1-c2-int(c2*e)),
             MWT_CSP_V1_newSG(self.c,self.c),
             MWT_CSP_V1_newSG(self.c,self.c),
             t_inject(self.c),
         ])
+
+    def _edge_guidance(self, x):
+        gray = x.mean(dim=1, keepdim=True)
+        grad_x = F.conv2d(gray, self.sobel_x, padding=1)
+        grad_y = F.conv2d(gray, self.sobel_y, padding=1)
+        edge = torch.sqrt(grad_x.pow(2) + grad_y.pow(2) + 1e-6)
+        return edge / edge.amax(dim=(2, 3), keepdim=True).clamp_min(1e-6)
+
     def forward(self, x):
         """Forward pass through C2f layer."""
         split_channels = [self.c2,int(self.c2*self.e), self.c1-self.c2-int(self.c2*self.e)]
         assert sum(split_channels) == x.size(1)
         rgb, t, A =  torch.split(x, split_channels, dim=1)
         y = list(self.cv1(rgb).chunk(2, 1))
+        y[-1] = self.edge_inject([y[-1], self._edge_guidance(rgb)])
         y.extend([self.m[0]([y[-1],A])])
         y.extend([self.m[2](self.m[1](y[-1]))])
         y.extend([self.m[3]([y[-1],t])])

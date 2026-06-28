@@ -230,7 +230,17 @@ def non_max_suppression(
     import torchvision  # scope for faster 'import ultralytics'
 
     # Checks
-    assert 0 <= conf_thres <= 1, f"Invalid Confidence threshold {conf_thres}, valid values are between 0.0 and 1.0"
+    if isinstance(conf_thres, (list, tuple, torch.Tensor)):
+        conf_thres = torch.as_tensor(conf_thres, device=prediction.device, dtype=prediction.dtype).flatten()
+        bs = prediction.shape[0]
+        if conf_thres.numel() == 1:
+            conf_thres = conf_thres.repeat(bs)
+        assert conf_thres.numel() == bs, f"Invalid batch-wise confidence threshold length {conf_thres.numel()}, expected {bs}"
+        assert bool(((conf_thres >= 0) & (conf_thres <= 1)).all()), (
+            f"Invalid Confidence threshold {conf_thres}, valid values are between 0.0 and 1.0"
+        )
+    else:
+        assert 0 <= conf_thres <= 1, f"Invalid Confidence threshold {conf_thres}, valid values are between 0.0 and 1.0"
     assert 0 <= iou_thres <= 1, f"Invalid IoU {iou_thres}, valid values are between 0.0 and 1.0"
     if isinstance(prediction, (list, tuple)):  # YOLOv8 model in validation model, output = (inference_out, loss_out)
         prediction = prediction[0]  # select only inference output
@@ -238,7 +248,7 @@ def non_max_suppression(
         classes = torch.tensor(classes, device=prediction.device)
 
     if prediction.shape[-1] == 6 or end2end:  # end-to-end model (BNC, i.e. 1,300,6)
-        output = [pred[pred[:, 4] > conf_thres][:max_det] for pred in prediction]
+        output = [pred[pred[:, 4] > (conf_thres[xi] if isinstance(conf_thres, torch.Tensor) else conf_thres)][:max_det] for xi, pred in enumerate(prediction)]
         if classes is not None:
             output = [pred[(pred[:, 5:6] == classes).any(1)] for pred in output]
         return output
@@ -247,7 +257,7 @@ def non_max_suppression(
     nc = nc or (prediction.shape[1] - 4)  # number of classes
     nm = prediction.shape[1] - nc - 4  # number of masks
     mi = 4 + nc  # mask start index
-    xc = prediction[:, 4:mi].amax(1) > conf_thres  # candidates
+    xc = prediction[:, 4:mi].amax(1) > (conf_thres.view(bs, 1) if isinstance(conf_thres, torch.Tensor) else conf_thres)  # candidates
 
     # Settings
     # min_wh = 2  # (pixels) minimum box width and height
@@ -264,6 +274,7 @@ def non_max_suppression(
     t = time.time()
     output = [torch.zeros((0, 6 + nm), device=prediction.device)] * bs
     for xi, x in enumerate(prediction):  # image index, image inference
+        conf_i = conf_thres[xi] if isinstance(conf_thres, torch.Tensor) else conf_thres
         # Apply constraints
         # x[((x[:, 2:4] < min_wh) | (x[:, 2:4] > max_wh)).any(1), 4] = 0  # width-height
         x = x[xc[xi]]  # confidence
@@ -284,11 +295,11 @@ def non_max_suppression(
         box, cls, mask = x.split((4, nc, nm), 1)
 
         if multi_label:
-            i, j = torch.where(cls > conf_thres)
+            i, j = torch.where(cls > conf_i)
             x = torch.cat((box[i], x[i, 4 + j, None], j[:, None].float(), mask[i]), 1)
         else:  # best class only
             conf, j = cls.max(1, keepdim=True)
-            x = torch.cat((box, conf, j.float(), mask), 1)[conf.view(-1) > conf_thres]
+            x = torch.cat((box, conf, j.float(), mask), 1)[conf.view(-1) > conf_i]
 
         # Filter by class
         if classes is not None:

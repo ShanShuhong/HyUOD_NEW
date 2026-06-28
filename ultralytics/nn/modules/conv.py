@@ -6,6 +6,7 @@ import math
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 __all__ = (
     "Conv",
@@ -745,7 +746,21 @@ class First_Conv(nn.Module):
         super().__init__()
         self.conv = nn.Conv2d(3, c2, k, s, autopad(k, p, d), groups=g, dilation=d, bias=False)
         self.bn = nn.BatchNorm2d(c2)
+        self.edge_scale = nn.Parameter(torch.tensor(0.1, dtype=torch.float32))
         self.act = self.default_act if act is True else act if isinstance(act, nn.Module) else nn.Identity()
+
+        sobel_x = torch.tensor([[1.0, 0.0, -1.0], [2.0, 0.0, -2.0], [1.0, 0.0, -1.0]], dtype=torch.float32)
+        sobel_y = torch.tensor([[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]], dtype=torch.float32)
+        self.register_buffer("sobel_x", sobel_x.view(1, 1, 3, 3), persistent=False)
+        self.register_buffer("sobel_y", sobel_y.view(1, 1, 3, 3), persistent=False)
+
+    def _edge_enhance(self, rgb):
+        gray = rgb.mean(dim=1, keepdim=True)
+        grad_x = F.conv2d(gray, self.sobel_x, padding=1)
+        grad_y = F.conv2d(gray, self.sobel_y, padding=1)
+        edge = torch.sqrt(grad_x.pow(2) + grad_y.pow(2) + 1e-6)
+        edge = edge / edge.amax(dim=(2, 3), keepdim=True).clamp_min(1e-6)
+        return rgb + self.edge_scale * edge.expand_as(rgb)
 
     def forward(self, x):
         """
@@ -757,7 +772,7 @@ class First_Conv(nn.Module):
         Returns:
             (torch.Tensor): Output tensor.
         """
-        x = x[:,:3,:,:]
+        x = self._edge_enhance(x[:, :3, :, :])
         return self.act(self.bn(self.conv(x)))
 
     def forward_fuse(self, x):
@@ -770,7 +785,7 @@ class First_Conv(nn.Module):
         Returns:
             (torch.Tensor): Output tensor.
         """
-        x = x[:,:3,:,:]
+        x = self._edge_enhance(x[:, :3, :, :])
         return self.act(self.conv(x))
 '''
 from .ops_dcnv3.modules import DCNv3,DCNv3_pytorch

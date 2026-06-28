@@ -63,6 +63,8 @@ class DetectionValidator(BaseValidator):
         self.iouv = torch.linspace(0.5, 0.95, 10)  # IoU vector for mAP@0.5:0.95
         self.niou = self.iouv.numel()
         self.lb = []  # for autolabelling
+        self.actm_last_conf = float(self.args.conf) if self.args.conf is not None else 0.001
+        self.actm_conf_history = []
         if self.args.save_hybrid and self.args.task == "detect":
             LOGGER.warning(
                 "WARNING ⚠️ 'save_hybrid=True' will append ground truth to predictions for autolabelling.\n"
@@ -125,6 +127,39 @@ class DetectionValidator(BaseValidator):
         """Return a formatted string summarizing class metrics of YOLO model."""
         return ("%22s" + "%11s" * 6) % ("Class", "Images", "Instances", "Box(P", "R", "mAP50", "mAP50-95)")
 
+    def _compute_actm_conf(self, preds):
+        """Compute adaptive confidence thresholds for each image from raw class scores."""
+        if not getattr(self.args, "actm", False):
+            return self.args.conf
+
+        pred_tensor = preds[0] if isinstance(preds, (list, tuple)) else preds
+        if pred_tensor.shape[-1] == 6 or self.end2end:
+            score_bank = pred_tensor[..., 4]
+        else:
+            score_bank = pred_tensor[:, 4 : 4 + self.nc, :].amax(1)
+
+        beta = float(self.args.actm_beta)
+        gamma = float(self.args.actm_gamma)
+        min_conf = float(self.args.actm_min_conf)
+        max_conf = float(self.args.actm_max_conf)
+        dynamic_conf = []
+
+        for scores in score_bank:
+            if scores.numel():
+                score_stat = scores.mean().item()
+            else:
+                score_stat = self.actm_last_conf
+            candidate = gamma * score_stat + (1.0 - beta) * self.actm_last_conf + beta * self.args.conf
+            candidate = min(max(candidate, min_conf), max_conf)
+            dynamic_conf.append(candidate)
+            self.actm_last_conf = candidate
+            self.actm_conf_history.append(candidate)
+
+        if getattr(self.args, "actm_log", False) and dynamic_conf:
+            LOGGER.info("ACTM conf thresholds: %s", ", ".join(f"{conf:.4f}" for conf in dynamic_conf))
+
+        return dynamic_conf
+
     def postprocess(self, preds):
         """
         Apply Non-maximum suppression to prediction outputs.
@@ -135,9 +170,10 @@ class DetectionValidator(BaseValidator):
         Returns:
             (List[torch.Tensor]): Processed predictions after NMS.
         """
+        conf = self._compute_actm_conf(preds)
         return ops.non_max_suppression(
             preds,
-            self.args.conf,
+            conf,
             self.args.iou,
             labels=self.lb,
             nc=self.nc,

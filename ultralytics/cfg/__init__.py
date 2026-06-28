@@ -185,6 +185,10 @@ CFG_FRACTION_KEYS = frozenset(
         "conf",
         "iou",
         "fraction",
+        "actm_gamma",
+        "actm_beta",
+        "actm_min_conf",
+        "actm_max_conf",
     }
 )
 CFG_INT_KEYS = frozenset(
@@ -238,6 +242,8 @@ CFG_BOOL_KEYS = frozenset(
         "nms",
         "profile",
         "multi_scale",
+        "actm",
+        "actm_log",
     }
 )
 
