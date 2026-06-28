@@ -120,10 +120,34 @@ class DetectionValidator(BaseValidator):
         self.seen = 0
         self.jdict = []
         self.stats = dict(tp=[], conf=[], pred_cls=[], target_cls=[], target_img=[])
+        self._reset_actm_state()
 
-    def get_desc(self):
-        """Return a formatted string summarizing class metrics of YOLO model."""
-        return ("%22s" + "%11s" * 6) % ("Class", "Images", "Instances", "Box(P", "R", "mAP50", "mAP50-95)")
+    def _reset_actm_state(self):
+        """Reset adaptive confidence threshold state for a validation run."""
+        self.actm_alpha = float(self.args.actm_gamma)
+        self.actm_updates = 0
+
+    def _extract_scores(self, preds):
+        """Extract per-image candidate confidence scores from raw model predictions."""
+        if preds.shape[-1] == 6 or self.end2end:
+            return [pred[:, 4] for pred in preds]
+        nc = self.nc or (preds.shape[1] - 4)
+        mi = 4 + nc
+        return [preds[i, 4:mi].amax(0) for i in range(preds.shape[0])]
+
+    def _compute_actm_conf(self, scores):
+        """Update and return the adaptive confidence threshold for one image."""
+        gamma = float(self.args.actm_gamma)
+        beta = float(self.args.actm_beta)
+        min_conf = float(self.args.actm_min_conf)
+        max_conf = float(self.args.actm_max_conf)
+        reliable_scores = scores[scores >= gamma]
+        if reliable_scores.numel():
+            m_t = reliable_scores.mean().item()
+            self.actm_alpha = beta * m_t + (1.0 - beta) * self.actm_alpha
+            self.actm_updates += 1
+        self.actm_alpha = min(max(self.actm_alpha, min_conf), max_conf)
+        return self.actm_alpha
 
     def postprocess(self, preds):
         """
@@ -135,18 +159,42 @@ class DetectionValidator(BaseValidator):
         Returns:
             (List[torch.Tensor]): Processed predictions after NMS.
         """
-        return ops.non_max_suppression(
-            preds,
-            self.args.conf,
-            self.args.iou,
-            labels=self.lb,
-            nc=self.nc,
-            multi_label=True,
-            agnostic=self.args.single_cls or self.args.agnostic_nms,
-            max_det=self.args.max_det,
-            end2end=self.end2end,
-            rotated=self.args.task == "obb",
-        )
+        if not self.args.actm:
+            return ops.non_max_suppression(
+                preds,
+                self.args.conf,
+                self.args.iou,
+                labels=self.lb,
+                nc=self.nc,
+                multi_label=True,
+                agnostic=self.args.single_cls or self.args.agnostic_nms,
+                max_det=self.args.max_det,
+                end2end=self.end2end,
+                rotated=self.args.task == "obb",
+            )
+
+        outputs = []
+        score_list = self._extract_scores(preds)
+        for i, scores in enumerate(score_list):
+            conf_thres = self._compute_actm_conf(scores)
+            if self.args.actm_log and self.actm_updates <= 5:
+                LOGGER.info(f"ACTM update {self.actm_updates}: conf_thres={conf_thres:.6f}")
+            labels = self.lb[i : i + 1] if self.lb else []
+            outputs.extend(
+                ops.non_max_suppression(
+                    preds[i : i + 1],
+                    conf_thres,
+                    self.args.iou,
+                    labels=labels,
+                    nc=self.nc,
+                    multi_label=True,
+                    agnostic=self.args.single_cls or self.args.agnostic_nms,
+                    max_det=self.args.max_det,
+                    end2end=self.end2end,
+                    rotated=self.args.task == "obb",
+                )
+            )
+        return outputs
 
     def _prepare_batch(self, si, batch):
         """
