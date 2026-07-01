@@ -195,22 +195,6 @@ class DetectionTrainer(BaseTrainer):
             on_plot=self.on_plot,
         )
 
-        if batch['img'].size(1) > 3:
-            plot_images(images=batch['img'][:, 3:6],  # 再画IR图像
-                        batch_idx=batch['batch_idx'],
-                        cls=batch['cls'].squeeze(-1),
-                        bboxes=batch['bboxes'],
-                        paths=batch['im_file'],
-                        fname=self.save_dir / f'train_batch_t_{ni}.jpg',
-                        on_plot=self.on_plot)
-            plot_images(images=batch['img'][:, 6:],  # 最后画A
-                        batch_idx=batch['batch_idx'],
-                        cls=batch['cls'].squeeze(-1),
-                        bboxes=batch['bboxes'],
-                        paths=batch['im_file'],
-                        fname=self.save_dir / f'train_batch_A_{ni}.jpg',
-                        on_plot=self.on_plot)
-
     def plot_metrics(self):
         """Plot metrics from a CSV file."""
         plot_results(file=self.csv, on_plot=self.on_plot)  # save results.png

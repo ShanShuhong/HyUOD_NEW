@@ -359,23 +359,6 @@ class DetectionValidator(BaseValidator):
                     fname=self.save_dir / f'val_batch_rgb_{ni}_labels.jpg',
                     names=self.names,
                     on_plot=self.on_plot)
-        if batch['img'].size(1) > 8:
-            plot_images(batch['img'][:, 3:6],
-                        batch['batch_idx'],
-                        batch['cls'].squeeze(-1),
-                        batch['bboxes'],
-                        paths=batch['im_file'],
-                        fname=self.save_dir / f'val_batch_t_{ni}_labels.jpg',
-                        names=self.names,
-                        on_plot=self.on_plot)
-            plot_images(batch['img'][:, -3:],
-                        batch['batch_idx'],
-                        batch['cls'].squeeze(-1),
-                        batch['bboxes'],
-                        paths=batch['im_file'],
-                        fname=self.save_dir / f'val_batch_a_{ni}_labels.jpg',
-                        names=self.names,
-                        on_plot=self.on_plot)
 
     def plot_predictions(self, batch, preds, ni):
         """
@@ -400,19 +383,6 @@ class DetectionValidator(BaseValidator):
                     fname=self.save_dir / f'val_batch_rgb_{ni}_pred.jpg',
                     names=self.names,
                     on_plot=self.on_plot)  # pred
-        if batch['img'].size(1) > 3:
-            plot_images(batch['img'][:, 3:6],
-                        *output_to_target(preds, max_det=self.args.max_det),
-                        paths=batch['im_file'],
-                        fname=self.save_dir / f'val_batch_t_{ni}_pred.jpg',
-                        names=self.names,
-                        on_plot=self.on_plot)  # pred
-            plot_images(batch['img'][:, -3:],
-                        *output_to_target(preds, max_det=self.args.max_det),
-                        paths=batch['im_file'],
-                        fname=self.save_dir / f'val_batch_a_{ni}_pred.jpg',
-                        names=self.names,
-                        on_plot=self.on_plot)  # pred
 
     def save_one_txt(self, predn, save_conf, shape, file):
         """

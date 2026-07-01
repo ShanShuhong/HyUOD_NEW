@@ -747,6 +747,9 @@ class First_Conv(nn.Module):
         self.bn = nn.BatchNorm2d(c2)
         self.act = self.default_act if act is True else act if isinstance(act, nn.Module) else nn.Identity()
 
+    def _select_rgb(self, x):
+        return x[:, :3, :, :] if x.shape[1] > 3 else x
+
     def forward(self, x):
         """
         Apply convolution, batch normalization and activation to input tensor.
@@ -757,8 +760,7 @@ class First_Conv(nn.Module):
         Returns:
             (torch.Tensor): Output tensor.
         """
-        x = x[:,:3,:,:]
-        return self.act(self.bn(self.conv(x)))
+        return self.act(self.bn(self.conv(self._select_rgb(x))))
 
     def forward_fuse(self, x):
         """
@@ -770,8 +772,7 @@ class First_Conv(nn.Module):
         Returns:
             (torch.Tensor): Output tensor.
         """
-        x = x[:,:3,:,:]
-        return self.act(self.conv(x))
+        return self.act(self.conv(self._select_rgb(x)))
 '''
 from .ops_dcnv3.modules import DCNv3,DCNv3_pytorch
 

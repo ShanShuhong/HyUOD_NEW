@@ -1883,24 +1883,22 @@ class t_head(nn.Module):
     def __init__(self, c1, c2):
         super(t_head, self).__init__()
         self.down = nn.AvgPool2d(kernel_size=2, stride=2)
-        self.dyconv1 =DynamicConv(in_planes=3, out_planes=int(c2/2), kernel_size=3, stride=1, padding=1, bias=False)
+        self.dyconv1 =DynamicConv(in_planes=c1, out_planes=int(c2/2), kernel_size=3, stride=1, padding=1, bias=False)
         self.dyconv2 =DynamicConv(in_planes=int(c2/2), out_planes=c2, kernel_size=3, stride=1, padding=1, bias=False)
         self.silu = nn.SiLU()
-        
+
     def forward(self, x):
-        t = x[:,3:6,:,:]
-        return self.silu(self.dyconv2(self.dyconv1(self.down(t))))
+        return self.silu(self.dyconv2(self.dyconv1(self.down(x))))
 
 class A_head(nn.Module):
     def __init__(self, c1, c2):
         super(A_head, self).__init__()
         self.down = nn.AvgPool2d(kernel_size=32, stride=32)
-        self.dyconv1 =DynamicConv(in_planes=3, out_planes=int(c2/2), kernel_size=1, stride=1, padding=0, bias=False)
+        self.dyconv1 =DynamicConv(in_planes=c1, out_planes=int(c2/2), kernel_size=1, stride=1, padding=0, bias=False)
         self.dyconv2 =DynamicConv(in_planes=int(c2/2), out_planes=c2, kernel_size=1, stride=1, padding=0, bias=False)
 
     def forward(self, x):
-        # a = torch.cat([x[:,:,:3,:],x[:,:,6:,:]],1) 
-        return self.dyconv2(self.dyconv1(self.down(x[:,6:,:,:])))
+        return self.dyconv2(self.dyconv1(self.down(x)))
 
 class t_block(nn.Module):
     def __init__(self, c1, c2, k=3, s=1, p=1):
