@@ -54,6 +54,8 @@ __all__ = (
     "SCDown",
     "TorchVision",
     "Input_agent",
+    "PhysicsTA",
+    "LightPhysicalGate",
     "t_head",
     "A_head",
     "t_block",
@@ -1878,6 +1880,59 @@ class Input_agent(nn.Module):
     def forward(self, x):
 
         return x
+
+
+class PhysicsTA(nn.Module):
+    """Generate lightweight transmission and atmospheric-light hints from RGB input."""
+
+    def __init__(self, c1=3, c2=9, pool_kernel=3, top_ratio=0.01):
+        super().__init__()
+        if c2 != 9:
+            raise ValueError("PhysicsTA expects c2=9 to output RGB+T+A channels.")
+        self.pool_kernel = pool_kernel
+        self.top_ratio = top_ratio
+        self.t_scale = nn.Parameter(torch.tensor(0.95))
+
+    def forward(self, x):
+        rgb = x[:, :3, :, :]
+        pad = self.pool_kernel // 2
+        dark = torch.minimum(rgb[:, 0:1], rgb[:, 1:2])
+        dark = -F.max_pool2d(-dark, kernel_size=self.pool_kernel, stride=1, padding=pad)
+        b, _, h, w = rgb.shape
+        k = max(1, int(h * w * self.top_ratio))
+        top_idx = dark.flatten(2).topk(k, dim=2).indices.expand(-1, 3, -1)
+        a = rgb.flatten(2).gather(2, top_idx).mean(dim=2).view(b, 3, 1, 1).clamp_min(1e-3)
+        norm_bg = torch.minimum(rgb[:, 0:1] / a[:, 0:1], rgb[:, 1:2] / a[:, 1:2])
+        norm_bg = -F.max_pool2d(-norm_bg, kernel_size=self.pool_kernel, stride=1, padding=pad)
+        t_b = (1.0 - self.t_scale.clamp(0.0, 1.0) * norm_bg).clamp(0.1, 0.9)
+        eta_r_over_eta_b = ((-0.00113 * 700 + 1.62517) * a[:, 0:1]) / ((-0.00113 * 450 + 1.62517) * a[:, 2:3])
+        eta_g_over_eta_b = ((-0.00113 * 550 + 1.62517) * a[:, 0:1]) / ((-0.00113 * 450 + 1.62517) * a[:, 1:2])
+        t_g = t_b.pow(eta_g_over_eta_b.clamp(0.25, 4.0))
+        t_r = t_b.pow(eta_r_over_eta_b.clamp(0.25, 4.0))
+        t = torch.cat((t_b, t_g, t_r), dim=1)
+        a = a.expand_as(rgb)
+        return torch.cat((rgb, t, a), dim=1)
+
+
+class LightPhysicalGate(nn.Module):
+    """Low-parameter T/A gate for deep features."""
+
+    def __init__(self, c1, c2, e=0.5):
+        super().__init__()
+        self.c2 = c2
+        self.t_channels = int(c2 * e)
+        self.a_channels = c1 - c2 - self.t_channels
+        self.alpha = nn.Parameter(torch.zeros(1, c2, 1, 1))
+        self.beta = nn.Parameter(torch.zeros(1, c2, 1, 1))
+        self.bn = nn.BatchNorm2d(c2)
+        self.act = nn.SiLU()
+
+    def forward(self, x):
+        rgb, t, a = torch.split(x, [self.c2, self.t_channels, self.a_channels], dim=1)
+        t_gate = torch.sigmoid(t.mean(dim=1, keepdim=True))
+        a_gate = torch.sigmoid(a.mean(dim=1, keepdim=True))
+        y = rgb * (1.0 + self.alpha * t_gate) + self.beta * a_gate
+        return self.act(self.bn(y))
     
 class t_head(nn.Module):
     def __init__(self, c1, c2):
