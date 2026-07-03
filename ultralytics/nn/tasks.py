@@ -64,6 +64,9 @@ from ultralytics.nn.modules import (
     WorldDetect,
     v10Detect,
     Input_agent,
+    PhysicsTA,
+    LightPhysicalGate,
+    EdgeRefine,
     t_head,
     A_head,
     frequent_block,
@@ -1139,6 +1142,8 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             SCDown,
             C2fCIB,
             A2C2f,
+            LightPhysicalGate,
+            EdgeRefine,
             t_head,
             A_head,
             frequent_block,
@@ -1201,6 +1206,9 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
                 legacy = False
                 if scale in "lx":  # for L/X sizes
                     args.extend((True, 1.2))
+        elif m is PhysicsTA:
+            c1, c2 = ch[f], 9
+            args = [c1, c2, *args[1:]]
         elif m is AIFI:
             args = [ch[f], *args]
         elif m in frozenset({HGStem, HGBlock}):

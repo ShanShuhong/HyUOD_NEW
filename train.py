@@ -1,14 +1,15 @@
 from ultralytics import YOLO
 import os
 import argparse
+
 if __name__ == "__main__":
     # Initialize the command-line argument parser
     parser = argparse.ArgumentParser(description="YOLO training script.")
-    
+
     # Add the two required arguments
     parser.add_argument("model_yaml", type=str, help="Path to the model YAML file")
     parser.add_argument("data_yaml", type=str, help="Path to the dataset YAML file")
-    
+
     # Parse the arguments
     args = parser.parse_args()
 

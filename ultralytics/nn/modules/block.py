@@ -54,6 +54,9 @@ __all__ = (
     "SCDown",
     "TorchVision",
     "Input_agent",
+    "PhysicsTA",
+    "LightPhysicalGate",
+    "EdgeRefine",
     "t_head",
     "A_head",
     "t_block",
@@ -1873,22 +1876,101 @@ class A2C2f(nn.Module):
 #### tA_process ####
 
 class Input_agent(nn.Module):
-    def __init__(self,  *args, **kwargs):
-            super(Input_agent, self).__init__()
+    def __init__(self, *args, **kwargs):
+        super(Input_agent, self).__init__()
+
     def forward(self, x):
 
         return x
-    
+
+
+class PhysicsTA(nn.Module):
+    """Generate lightweight transmission and atmospheric-light hints from RGB input."""
+
+    def __init__(self, c1=3, c2=9, pool_kernel=3, top_ratio=0.01):
+        super().__init__()
+        if c2 != 9:
+            raise ValueError("PhysicsTA expects c2=9 to output RGB+T+A channels.")
+        self.pool_kernel = pool_kernel
+        self.top_ratio = top_ratio
+        self.t_scale = nn.Parameter(torch.tensor(0.95))
+
+    def forward(self, x):
+        rgb = x[:, :3, :, :]
+        pad = self.pool_kernel // 2
+        dark = torch.minimum(rgb[:, 0:1], rgb[:, 1:2])
+        dark = -F.max_pool2d(-dark, kernel_size=self.pool_kernel, stride=1, padding=pad)
+        b, _, h, w = rgb.shape
+        k = max(1, int(h * w * self.top_ratio))
+        top_idx = dark.flatten(2).topk(k, dim=2).indices.expand(-1, 3, -1)
+        a_prior = rgb.flatten(2).gather(2, top_idx).mean(dim=2).view(b, 3, 1, 1).clamp_min(1e-3)
+        norm_bg = torch.minimum(rgb[:, 0:1] / a_prior[:, 0:1], rgb[:, 1:2] / a_prior[:, 1:2])
+        norm_bg = -F.max_pool2d(-norm_bg, kernel_size=self.pool_kernel, stride=1, padding=pad)
+        t_b = (1.0 - self.t_scale.clamp(0.0, 1.0) * norm_bg).clamp(0.1, 0.9)
+        eta_r_over_eta_b = ((-0.00113 * 700 + 1.62517) * a_prior[:, 0:1]) / (
+                    (-0.00113 * 450 + 1.62517) * a_prior[:, 2:3])
+        eta_g_over_eta_b = ((-0.00113 * 550 + 1.62517) * a_prior[:, 0:1]) / (
+                    (-0.00113 * 450 + 1.62517) * a_prior[:, 1:2])
+        t_g = t_b.pow(eta_g_over_eta_b.clamp(0.25, 4.0))
+        t_r = t_b.pow(eta_r_over_eta_b.clamp(0.25, 4.0))
+        t = torch.cat((t_b, t_g, t_r), dim=1)
+        a = a_prior.expand_as(rgb)
+        return torch.cat((rgb, t, a), dim=1)
+
+
+class LightPhysicalGate(nn.Module):
+    """Low-parameter T/A gate for deep features."""
+
+    def __init__(self, c1, c2, e=0.5):
+        super().__init__()
+        self.c2 = c2
+        self.t_channels = int(c2 * e)
+        self.a_channels = c1 - c2 - self.t_channels
+        self.alpha = nn.Parameter(torch.zeros(1, c2, 1, 1))
+        self.beta = nn.Parameter(torch.zeros(1, c2, 1, 1))
+        self.bn = nn.BatchNorm2d(c2)
+        self.act = nn.SiLU()
+
+    def forward(self, x):
+        rgb, t, a = torch.split(x, [self.c2, self.t_channels, self.a_channels], dim=1)
+        t_gate = torch.sigmoid(t.mean(dim=1, keepdim=True))
+        a_gate = torch.sigmoid(a.mean(dim=1, keepdim=True))
+        y = rgb * (1.0 + self.alpha * t_gate) + self.beta * a_gate
+        return self.act(self.bn(y))
+
+
+class EdgeRefine(nn.Module):
+    """Lightweight fixed-edge feature refinement for better localization."""
+
+    def __init__(self, c1, c2):
+        super().__init__()
+        self.proj = Conv(c1, c2, 1, 1) if c1 != c2 else nn.Identity()
+        self.alpha = nn.Parameter(torch.zeros(1, c2, 1, 1))
+        sobel_x = torch.tensor([[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]).view(1, 1, 3, 3)
+        sobel_y = torch.tensor([[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]]).view(1, 1, 3, 3)
+        self.register_buffer("sobel_x", sobel_x)
+        self.register_buffer("sobel_y", sobel_y)
+
+    def forward(self, x):
+        y = self.proj(x)
+        edge_src = y.mean(dim=1, keepdim=True)
+        gx = F.conv2d(edge_src, self.sobel_x.to(dtype=y.dtype), padding=1)
+        gy = F.conv2d(edge_src, self.sobel_y.to(dtype=y.dtype), padding=1)
+        edge = torch.sqrt(gx.square() + gy.square() + 1e-6)
+        edge = edge / edge.amax(dim=(2, 3), keepdim=True).clamp_min(1e-6)
+        return y * (1.0 + self.alpha * edge)
+
+
 class t_head(nn.Module):
     def __init__(self, c1, c2):
         super(t_head, self).__init__()
         self.down = nn.AvgPool2d(kernel_size=2, stride=2)
-        self.dyconv1 =DynamicConv(in_planes=3, out_planes=int(c2/2), kernel_size=3, stride=1, padding=1, bias=False)
-        self.dyconv2 =DynamicConv(in_planes=int(c2/2), out_planes=c2, kernel_size=3, stride=1, padding=1, bias=False)
+        self.dyconv1 = DynamicConv(in_planes=3, out_planes=int(c2 / 2), kernel_size=3, stride=1, padding=1, bias=False)
+        self.dyconv2 = DynamicConv(in_planes=int(c2 / 2), out_planes=c2, kernel_size=3, stride=1, padding=1, bias=False)
         self.silu = nn.SiLU()
-        
+
     def forward(self, x):
-        t = x[:,3:6,:,:]
+        t = x[:, 3:6, :, :]
         return self.silu(self.dyconv2(self.dyconv1(self.down(t))))
 
 class A_head(nn.Module):
@@ -1899,31 +1981,34 @@ class A_head(nn.Module):
         self.dyconv2 =DynamicConv(in_planes=int(c2/2), out_planes=c2, kernel_size=1, stride=1, padding=0, bias=False)
 
     def forward(self, x):
-        # a = torch.cat([x[:,:,:3,:],x[:,:,6:,:]],1) 
-        return self.dyconv2(self.dyconv1(self.down(x[:,6:,:,:])))
+        # a = torch.cat([x[:,:,:3,:],x[:,:,6:,:]],1)
+        return self.dyconv2(self.dyconv1(self.down(x[:, 6:, :, :])))
 
 class t_block(nn.Module):
     def __init__(self, c1, c2, k=3, s=1, p=1):
         super(t_block, self).__init__()
         self.down = nn.AvgPool2d(kernel_size=2, stride=2)
-        self.dyconv1 =DynamicConv(in_planes=c1, out_planes=c2, kernel_size=k, grounps=8, stride=s, padding=p, bias=False)
+        self.dyconv1 = DynamicConv(in_planes=c1, out_planes=c2, kernel_size=k, grounps=8, stride=s, padding=p,
+                                   bias=False)
         self.silu = nn.SiLU()
         self.c1 = c1
         self.c2 = c2
-        
+
     def forward(self, x):
-        return self.silu(self.dyconv1(self.down(channel_shuffle(x,8))))
-    
+        return self.silu(self.dyconv1(self.down(channel_shuffle(x, 8))))
+
+
 class A_block(nn.Module):
     def __init__(self, c1, c2, level, down=False, k=1, s=1, p=0):
         super(A_block, self).__init__()
         # self.down = nn.AvgPool2d(kernel_size=2, stride=2)
         self.dyconv1 = DynamicConv(in_planes=c1, out_planes=c2, kernel_size=k, stride=s, padding=p, bias=False)
-        self.upsample = nn.Upsample(scale_factor=2**(4-level), mode='nearest')
+        self.upsample = nn.Upsample(scale_factor=2 ** (4 - level), mode='nearest')
         if down is True:
-            self.scale = 2**(5-level)
+            self.scale = 2 ** (5 - level)
         self.down = down
-            # return F.interpolate(x, size=target_size, mode='nearest')
+        # return F.interpolate(x, size=target_size, mode='nearest')
+
     def forward(self, x):
         # x = torch.cat([x[0][:,-3:,:,:],x[1]],1)
         if self.down is True:
@@ -1933,31 +2018,33 @@ class A_block(nn.Module):
         x = self.upsample(self.dyconv1(x))
         return x
 
+
 class MWT_CSP_V1_newSG(nn.Module):
     def __init__(self, c1, c2, level=3, k=1, s=1, agent_conv_1=False, p=None, g=1, d=1, act=True, *args, **kwargs):
         super(MWT_CSP_V1_newSG, self).__init__()
-        c_ = c2 // 2  
-        self.cv1 = Conv(c2, c_, 1, 1, p, g, act=act) 
+        c_ = c2 // 2
+        self.cv1 = Conv(c2, c_, 1, 1, p, g, act=act)
         c_1 = c_
-        self.level=level
-        self.c1=c1
-        self.c2=c2
+        self.level = level
+        self.c1 = c1
+        self.c2 = c2
         self.k = k
         self.MW = Multiscale_waveletconv(c_1, c_1, wt_levels=level)
         self_gate = []
-        self_gate.append(SG_new(c_1,group=level+1))
-        self_gate= self_gate+[SG_new(c_1*4,group=_, groups=4) for _ in range(level+1,0,-1)]
+        self_gate.append(SG_new(c_1, group=level + 1))
+        self_gate = self_gate + [SG_new(c_1 * 4, group=_, groups=4) for _ in range(level + 1, 0, -1)]
         self.self_gate = nn.ModuleList(self_gate)
-        self.iwt = IWT(c_1,c_1,wt_levels=level,agent_conv_1=agent_conv_1)
+        self.iwt = IWT(c_1, c_1, wt_levels=level, agent_conv_1=agent_conv_1)
         self.BS = nn.Sequential(
             nn.BatchNorm2d(c_),
             nn.SiLU())
-        
-        self.brk = BrokenBlock(c2, group=c2//2)
-        self.cv2 = Conv(c2, c2, 1, 1, act=act) 
+
+        self.brk = BrokenBlock(c2, group=c2 // 2)
+        self.cv2 = Conv(c2, c2, 1, 1, act=act)
+
     def forward(self, x):
-        c1 =self.c1
-        c2 =self.c2
+        c1 = self.c1
+        c2 = self.c2
         # x.shape = [batch, channel, H, W]
         # x = self.cv1(x)  ## x-> [batch, channel, H, W]
         x = self.cv1(x)
@@ -1965,8 +2052,8 @@ class MWT_CSP_V1_newSG(nn.Module):
         ## x_chunk[0]-> (list) 4个[batch, channel, H, W]
         ## x_chunk[>0]-> (list) n个[batch, channel, 4, H, W]
         x_chunk[0] = self.self_gate[0](torch.stack(x_chunk[0], dim=1))
-        
-        for i in range(1, self.level+1):
+
+        for i in range(1, self.level + 1):
             x_chunk_ = torch.stack(x_chunk[i], dim=1)
             # x_chunk[i]:n个[batch, channel,4,H,W] -> x_chunk_:[batch, group, channel,4,H,W]
             batch, group, channel, _, H, W = x_chunk_.size()
@@ -1983,27 +2070,32 @@ class MWT_CSP_V1_newSG(nn.Module):
         x1 = self.iwt([x_chunk, shapes_in_levels])
         x1 = self.BS(x1)
 
-        y = torch.cat((x, x1),dim=1)
+        y = torch.cat((x, x1), dim=1)
         if self.training:
             y = self.brk(y)
         else:
             y = y
         return self.cv2(y)
-    
+
+
 class A_inject(nn.Module):
     def __init__(self, c1, prompt_planes, k=3, s=1, p=1):
         super(A_inject, self).__init__()
-        self.cdyconv1 = Cross_DynamicConv(prompt_planes=prompt_planes,in_planes=c1, out_planes=c1, grounps=8, kernel_size=k, stride=s, padding=p, bias=False)
-        self.cdyconv2 = Cross_DynamicConv(prompt_planes=prompt_planes,in_planes=c1, out_planes=c1, grounps=8, kernel_size=k, stride=s, padding=p, bias=False)
+        self.cdyconv1 = Cross_DynamicConv(prompt_planes=prompt_planes, in_planes=c1, out_planes=c1, grounps=8,
+                                          kernel_size=k, stride=s, padding=p, bias=False)
+        self.cdyconv2 = Cross_DynamicConv(prompt_planes=prompt_planes, in_planes=c1, out_planes=c1, grounps=8,
+                                          kernel_size=k, stride=s, padding=p, bias=False)
         self.bn = nn.BatchNorm2d(c1)
         self.silu = nn.SiLU()
+
     def forward(self, x):
         # x is [RGB_feature, A_feature]
         # RGB_f, A_f = torch.chunk(x, chunks=2, dim=1)
         RGB_f, A_f = x
         x = self.cdyconv1(RGB_f, A_f)
-        x = self.cdyconv2(channel_shuffle(x,8), A_f)
-        return self.silu(self.bn(x+RGB_f))
+        x = self.cdyconv2(channel_shuffle(x, 8), A_f)
+        return self.silu(self.bn(x + RGB_f))
+
 
 # class t_inject(nn.Module):
 #     def __init__(self, c1, k=3, s=1, p=1):
@@ -2030,22 +2122,24 @@ class t_inject(nn.Module):
     def __init__(self, c1, k=3, s=1, p=1):
         super(t_inject, self).__init__()
         self.conv1 = nn.Conv2d(c1, c1, 1, 1, bias=False)
-        self.dyconv_t = CrossDCNv3_pytorch(c1,c1)
+        self.dyconv_t = CrossDCNv3_pytorch(c1, c1)
         self.gap = nn.AdaptiveAvgPool2d(1)
         self.SiLU = nn.SiLU()
         self.sm = nn.Softmax(dim=1)
         self.alpha = nn.Parameter(torch.zeros((1, c1, 1, 1)))
         self.beta = nn.Parameter(torch.ones((1, c1, 1, 1)))
         self.c1 = c1
+
     def forward(self, x):
         x, t = x
-        _,_,h,w = x.shape
+        _, _, h, w = x.shape
         I = self.conv1(x)
         A = self.gap(I)
         I_ = self.dyconv_t(I, t)
-        attention = self.sm(t*I_)
-        J = ((1+self.alpha)*I-self.alpha*A)*attention*self.beta + x
+        attention = self.sm(t * I_)
+        J = ((1 + self.alpha) * I - self.alpha * A) * attention * self.beta + x
         return J
+
 
 class frequent_block(nn.Module):
     """Faster Implementation of CSP Bottleneck with 2 convolutions."""
@@ -2059,133 +2153,151 @@ class frequent_block(nn.Module):
         self.c1 = c1
         self.c2 = c2
         self.m = nn.ModuleList([
-            A_inject(self.c, c1-c2-int(c2*e)),
-            MWT_CSP_V1_newSG(self.c,self.c),
-            MWT_CSP_V1_newSG(self.c,self.c),
+            A_inject(self.c, c1 - c2 - int(c2 * e)),
+            MWT_CSP_V1_newSG(self.c, self.c),
+            MWT_CSP_V1_newSG(self.c, self.c),
             t_inject(self.c),
         ])
+
     def forward(self, x):
         """Forward pass through C2f layer."""
-        split_channels = [self.c2,int(self.c2*self.e), self.c1-self.c2-int(self.c2*self.e)]
+        split_channels = [self.c2, int(self.c2 * self.e), self.c1 - self.c2 - int(self.c2 * self.e)]
         assert sum(split_channels) == x.size(1)
-        rgb, t, A =  torch.split(x, split_channels, dim=1)
+        rgb, t, A = torch.split(x, split_channels, dim=1)
         y = list(self.cv1(rgb).chunk(2, 1))
-        y.extend([self.m[0]([y[-1],A])])
+        y.extend([self.m[0]([y[-1], A])])
         y.extend([self.m[2](self.m[1](y[-1]))])
-        y.extend([self.m[3]([y[-1],t])])
+        y.extend([self.m[3]([y[-1], t])])
         return self.cv2(torch.cat(y, 1))
-    
-class DynamicConv(nn.Module):
-    def __init__(self,in_planes,out_planes,kernel_size,stride,padding=0,dilation=1,grounps=1,bias=True,K=4,temprature=30,ratio=2,init_weight=True):
-        super().__init__()
-        self.in_planes=in_planes
-        self.out_planes=out_planes
-        self.kernel_size=kernel_size
-        self.stride=stride
-        self.padding=padding
-        self.dilation=dilation
-        self.groups=grounps
-        self.bias=bias
-        self.K=K
-        self.init_weight=init_weight
-        self.attention=DyAttention(in_planes=in_planes,ratio=ratio,K=K,temprature=temprature,init_weight=init_weight)
 
-        self.weight=nn.Parameter(torch.randn(K,out_planes,in_planes//grounps,kernel_size,kernel_size),requires_grad=True)
-        if(bias):
-            self.bias=nn.Parameter(torch.randn(K,out_planes),requires_grad=True)
+
+class DynamicConv(nn.Module):
+    def __init__(self, in_planes, out_planes, kernel_size, stride, padding=0, dilation=1, grounps=1, bias=True, K=4,
+                 temprature=30, ratio=2, init_weight=True):
+        super().__init__()
+        self.in_planes = in_planes
+        self.out_planes = out_planes
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+        self.groups = grounps
+        self.bias = bias
+        self.K = K
+        self.init_weight = init_weight
+        self.attention = DyAttention(in_planes=in_planes, ratio=ratio, K=K, temprature=temprature,
+                                     init_weight=init_weight)
+
+        self.weight = nn.Parameter(torch.randn(K, out_planes, in_planes // grounps, kernel_size, kernel_size),
+                                   requires_grad=True)
+        if (bias):
+            self.bias = nn.Parameter(torch.randn(K, out_planes), requires_grad=True)
         else:
-            self.bias=None
-        
-        if(self.init_weight):
+            self.bias = None
+
+        if (self.init_weight):
             self._initialize_weights()
 
-        #TODO 初始化
+        # TODO 初始化
+
     def _initialize_weights(self):
         for i in range(self.K):
             nn.init.kaiming_uniform_(self.weight[i])
 
-    def forward(self,x):
-        bs,in_planels,h,w=x.shape
-        softmax_att=self.attention(x) #bs,K
-        x=x.contiguous().view(1,-1,h,w)
-        weight=self.weight.view(self.K,-1) #K,-1
-        aggregate_weight=torch.mm(softmax_att,weight).view(bs*self.out_planes,self.in_planes//self.groups,self.kernel_size,self.kernel_size) #bs*out_p,in_p,k,k
+    def forward(self, x):
+        bs, in_planels, h, w = x.shape
+        softmax_att = self.attention(x)  # bs,K
+        x = x.contiguous().view(1, -1, h, w)
+        weight = self.weight.view(self.K, -1)  # K,-1
+        aggregate_weight = torch.mm(softmax_att, weight).view(bs * self.out_planes, self.in_planes // self.groups,
+                                                              self.kernel_size, self.kernel_size)  # bs*out_p,in_p,k,k
 
-        if(self.bias is not None):
-            bias=self.bias.view(self.K,-1) #K,out_p
-            aggregate_bias=torch.mm(softmax_att,bias).view(-1) #bs,out_p
-            output=F.conv2d(x,weight=aggregate_weight,bias=aggregate_bias,stride=self.stride,padding=self.padding,groups=self.groups*bs,dilation=self.dilation)
+        if (self.bias is not None):
+            bias = self.bias.view(self.K, -1)  # K,out_p
+            aggregate_bias = torch.mm(softmax_att, bias).view(-1)  # bs,out_p
+            output = F.conv2d(x, weight=aggregate_weight, bias=aggregate_bias, stride=self.stride, padding=self.padding,
+                              groups=self.groups * bs, dilation=self.dilation)
         else:
-            output=F.conv2d(x,weight=aggregate_weight,bias=None,stride=self.stride,padding=self.padding,groups=self.groups*bs,dilation=self.dilation)
-        
-        output=output.view(bs,self.out_planes,h,w)
+            output = F.conv2d(x, weight=aggregate_weight, bias=None, stride=self.stride, padding=self.padding,
+                              groups=self.groups * bs, dilation=self.dilation)
+
+        output = output.view(bs, self.out_planes, h, w)
         return output
+
 
 class Cross_DynamicConv(nn.Module):
-    def __init__(self,prompt_planes, in_planes,out_planes,kernel_size,stride,padding=0,dilation=1,grounps=1,bias=True,K=4,temprature=30,ratio=2,init_weight=True):
+    def __init__(self, prompt_planes, in_planes, out_planes, kernel_size, stride, padding=0, dilation=1, grounps=1,
+                 bias=True, K=4, temprature=30, ratio=2, init_weight=True):
         super().__init__()
-        self.in_planes=in_planes
-        self.out_planes=out_planes
-        self.kernel_size=kernel_size
-        self.stride=stride
-        self.padding=padding
-        self.dilation=dilation
-        self.groups=grounps
-        self.bias=bias
-        self.K=K
-        self.init_weight=init_weight
-        self.attention=DyAttention(in_planes=prompt_planes,ratio=ratio,K=K,temprature=temprature,init_weight=init_weight)
+        self.in_planes = in_planes
+        self.out_planes = out_planes
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+        self.groups = grounps
+        self.bias = bias
+        self.K = K
+        self.init_weight = init_weight
+        self.attention = DyAttention(in_planes=prompt_planes, ratio=ratio, K=K, temprature=temprature,
+                                     init_weight=init_weight)
 
-        self.weight=nn.Parameter(torch.randn(K,out_planes,in_planes//grounps,kernel_size,kernel_size),requires_grad=True)
-        if(bias):
-            self.bias=nn.Parameter(torch.randn(K,out_planes),requires_grad=True)
+        self.weight = nn.Parameter(torch.randn(K, out_planes, in_planes // grounps, kernel_size, kernel_size),
+                                   requires_grad=True)
+        if (bias):
+            self.bias = nn.Parameter(torch.randn(K, out_planes), requires_grad=True)
         else:
-            self.bias=None
-        
-        if(self.init_weight):
+            self.bias = None
+
+        if (self.init_weight):
             self._initialize_weights()
 
-        #TODO 初始化
+        # TODO 初始化
+
     def _initialize_weights(self):
         for i in range(self.K):
             nn.init.kaiming_uniform_(self.weight[i])
 
-    def forward(self,x,prompt):
-        bs,in_planels,h,w=x.shape
-        softmax_att=self.attention(prompt) #bs,K
-        x=x.contiguous().view(1,-1,h,w)
-        weight=self.weight.view(self.K,-1) #K,-1
-        aggregate_weight=torch.mm(softmax_att,weight).view(bs*self.out_planes,self.in_planes//self.groups,self.kernel_size,self.kernel_size) #bs*out_p,in_p,k,k
+    def forward(self, x, prompt):
+        bs, in_planels, h, w = x.shape
+        softmax_att = self.attention(prompt)  # bs,K
+        x = x.contiguous().view(1, -1, h, w)
+        weight = self.weight.view(self.K, -1)  # K,-1
+        aggregate_weight = torch.mm(softmax_att, weight).view(bs * self.out_planes, self.in_planes // self.groups,
+                                                              self.kernel_size, self.kernel_size)  # bs*out_p,in_p,k,k
 
-        if(self.bias is not None):
-            bias=self.bias.view(self.K,-1) #K,out_p
-            aggregate_bias=torch.mm(softmax_att,bias).view(-1) #bs,out_p
-            output=F.conv2d(x,weight=aggregate_weight,bias=aggregate_bias,stride=self.stride,padding=self.padding,groups=self.groups*bs,dilation=self.dilation)
+        if (self.bias is not None):
+            bias = self.bias.view(self.K, -1)  # K,out_p
+            aggregate_bias = torch.mm(softmax_att, bias).view(-1)  # bs,out_p
+            output = F.conv2d(x, weight=aggregate_weight, bias=aggregate_bias, stride=self.stride, padding=self.padding,
+                              groups=self.groups * bs, dilation=self.dilation)
         else:
-            output=F.conv2d(x,weight=aggregate_weight,bias=None,stride=self.stride,padding=self.padding,groups=self.groups*bs,dilation=self.dilation)
-        
-        output=output.view(bs,self.out_planes,h,w)
+            output = F.conv2d(x, weight=aggregate_weight, bias=None, stride=self.stride, padding=self.padding,
+                              groups=self.groups * bs, dilation=self.dilation)
+
+        output = output.view(bs, self.out_planes, h, w)
         return output
 
+
 class DyAttention(nn.Module):
-    def __init__(self,in_planes,ratio,K,temprature=30,init_weight=True):
+    def __init__(self, in_planes, ratio, K, temprature=30, init_weight=True):
         super().__init__()
-        self.avgpool=nn.AdaptiveAvgPool2d(1)
-        self.temprature=temprature
-        assert in_planes>ratio
-        hidden_planes=in_planes//ratio
-        self.net=nn.Sequential(
-            nn.Conv2d(in_planes,hidden_planes,kernel_size=1,bias=False),
+        self.avgpool = nn.AdaptiveAvgPool2d(1)
+        self.temprature = temprature
+        assert in_planes > ratio
+        hidden_planes = in_planes // ratio
+        self.net = nn.Sequential(
+            nn.Conv2d(in_planes, hidden_planes, kernel_size=1, bias=False),
             nn.ReLU(),
-            nn.Conv2d(hidden_planes,K,kernel_size=1,bias=False)
+            nn.Conv2d(hidden_planes, K, kernel_size=1, bias=False)
         )
 
-        if(init_weight):
+        if (init_weight):
             self._initialize_weights()
 
     def update_temprature(self):
-        if(self.temprature>1):
-            self.temprature-=1
+        if (self.temprature > 1):
+            self.temprature -= 1
 
     def _initialize_weights(self):
         for m in self.modules():
@@ -2193,22 +2305,24 @@ class DyAttention(nn.Module):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
-            if isinstance(m ,nn.BatchNorm2d):
+            if isinstance(m, nn.BatchNorm2d):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
 
-    def forward(self,x):
-        att=self.avgpool(x) #bs,dim,1,1
-        att=self.net(att).view(x.shape[0],-1) #bs,K
-        return F.softmax(att/self.temprature,-1)
+    def forward(self, x):
+        att = self.avgpool(x)  # bs,dim,1,1
+        att = self.net(att).view(x.shape[0], -1)  # bs,K
+        return F.softmax(att / self.temprature, -1)
+
 
 def channel_shuffle(x, groups):
-   batchsize, num_channels, height, width = x.data.size()
-   channels_per_group = num_channels // groups
-   x = x.view(batchsize, groups, channels_per_group, height, width)
-   x = torch.transpose(x, 1, 2).contiguous()
-   x = x.view(batchsize, -1, height, width)
-   return x
+    batchsize, num_channels, height, width = x.data.size()
+    channels_per_group = num_channels // groups
+    x = x.view(batchsize, groups, channels_per_group, height, width)
+    x = torch.transpose(x, 1, 2).contiguous()
+    x = x.view(batchsize, -1, height, width)
+    return x
+
 
 class C3k2_wcpm(nn.Module):
     """Faster Implementation of CSP Bottleneck with 2 convolutions."""
@@ -2232,11 +2346,11 @@ class C3k2_wcpm(nn.Module):
         self.m = nn.ModuleList(
             C3k(self.c, self.c, 2, shortcut, g) if c3k else Bottleneck(self.c, self.c, shortcut, g) for _ in range(n)
         )
-        self.mcpm = nn.ModuleList([            
-            MWT_CSP_V1_newSG(self.c,self.c),
-            MWT_CSP_V1_newSG(self.c,self.c),
-            ])
-        
+        self.mcpm = nn.ModuleList([
+            MWT_CSP_V1_newSG(self.c, self.c),
+            MWT_CSP_V1_newSG(self.c, self.c),
+        ])
+
     def forward(self, x):
         """Forward pass through C2f layer."""
         y = list(self.cv1(x).chunk(2, 1))

@@ -101,6 +101,8 @@ class BaseDataset(Dataset):
         self.img_path = img_path
         self.imgsz = imgsz
         self.augment = augment
+        self.hyp = hyp
+        self.input_channels = getattr(hyp, "ch", 3)
         self.single_cls = single_cls
         self.prefix = prefix
         self.fraction = fraction
@@ -215,8 +217,6 @@ class BaseDataset(Dataset):
             FileNotFoundError: If the image file is not found.
         """
         im, f, fn = self.ims[i], self.im_files[i], self.npy_files[i]
-        it = f.replace("images", 't')
-        ia = f.replace("images", 'a')
         if im is None:  # not cached in RAM
             if fn.exists():  # load npy
                 try:
@@ -227,9 +227,11 @@ class BaseDataset(Dataset):
                     im = cv2.imread(f)  # BGR
             else:  # read image
                 im = cv2.imread(f)  # BGR
-                # if self.hyp.ch > 3: 
-                im = cv2.merge((cv2.imread(it), im))
-                im = cv2.merge((cv2.imread(ia), im))
+                if self.input_channels > 3:
+                    it = f.replace("images", "t")
+                    ia = f.replace("images", "a")
+                    im = cv2.merge((cv2.imread(it), im))
+                    im = cv2.merge((cv2.imread(ia), im))
             if im is None:
                 raise FileNotFoundError(f"Image Not Found {f}")
             
