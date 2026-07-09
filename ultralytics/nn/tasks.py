@@ -65,7 +65,9 @@ from ultralytics.nn.modules import (
     v10Detect,
     Input_agent,
     PhysicsTA,
+    PhysicsTABaseline,
     LightPhysicalGate,
+    SmallAlignConcat,
     t_head,
     A_head,
     frequent_block,
@@ -1204,9 +1206,12 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
                 legacy = False
                 if scale in "lx":  # for L/X sizes
                     args.extend((True, 1.2))
-        elif m is PhysicsTA:
+        elif m in frozenset({PhysicsTA, PhysicsTABaseline}):
             c1, c2 = ch[f], 9
             args = [c1, c2, *args[1:]]
+        elif m is SmallAlignConcat:
+            c2 = sum(ch[x] for x in f)
+            args = [[ch[x] for x in f], *args]
         elif m is AIFI:
             args = [ch[f], *args]
         elif m in frozenset({HGStem, HGBlock}):

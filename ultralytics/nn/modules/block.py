@@ -55,7 +55,9 @@ __all__ = (
     "TorchVision",
     "Input_agent",
     "PhysicsTA",
+    "PhysicsTABaseline",
     "LightPhysicalGate",
+    "SmallAlignConcat",
     "t_head",
     "A_head",
     "t_block",
@@ -1914,6 +1916,47 @@ class PhysicsTA(nn.Module):
         return torch.cat((rgb, t, a), dim=1)
 
 
+class PhysicsTABaseline(nn.Module):
+    """Generate baseline-aligned RGB+T+A channels from RGB input inside the network."""
+
+    def __init__(self, c1=3, c2=9, pool_kernel=3, top_ratio=0.01, w=0.95):
+        super().__init__()
+        if c2 != 9:
+            raise ValueError("PhysicsTABaseline expects c2=9 to output RGB+T+A channels.")
+        self.pool_kernel = pool_kernel
+        self.top_ratio = top_ratio
+        self.w = w
+
+    def _dark_channel_bg(self, bgr):
+        pad = self.pool_kernel // 2
+        dark = torch.minimum(bgr[:, 0:1], bgr[:, 1:2])
+        return -F.max_pool2d(-dark, kernel_size=self.pool_kernel, stride=1, padding=pad)
+
+    def forward(self, x):
+        rgb = x[:, :3, :, :]
+        bgr = rgb[:, [2, 1, 0], :, :]
+        b, _, h, w = bgr.shape
+        k = max(1, int(h * w * self.top_ratio))
+
+        dark = self._dark_channel_bg(bgr)
+        top_idx = dark.flatten(2).topk(k, dim=2).indices.expand(-1, 3, -1)
+        atom_bgr = bgr.flatten(2).gather(2, top_idx).mean(dim=2).view(b, 3, 1, 1).clamp_min(1e-3)
+
+        norm_bgr = bgr / atom_bgr
+        t_b = (1.0 - self.w * self._dark_channel_bg(norm_bgr)).clamp(0.1, 0.9)
+        eta_r_over_eta_b = ((-0.00113 * 700 + 1.62517) * atom_bgr[:, 0:1]) / (
+            (-0.00113 * 450 + 1.62517) * atom_bgr[:, 2:3]
+        )
+        eta_g_over_eta_b = ((-0.00113 * 550 + 1.62517) * atom_bgr[:, 0:1]) / (
+            (-0.00113 * 450 + 1.62517) * atom_bgr[:, 1:2]
+        )
+        t_r = t_b.pow(eta_r_over_eta_b.clamp(0.25, 4.0))
+        t_g = t_b.pow(eta_g_over_eta_b.clamp(0.25, 4.0))
+        t_rgb = torch.cat((t_r, t_g, t_b), dim=1)
+        a_rgb = atom_bgr[:, [2, 1, 0], :, :].expand_as(rgb)
+        return torch.cat((rgb, t_rgb, a_rgb), dim=1)
+
+
 class LightPhysicalGate(nn.Module):
     """Low-parameter T/A gate for deep features."""
 
@@ -1933,6 +1976,52 @@ class LightPhysicalGate(nn.Module):
         a_gate = torch.sigmoid(a.mean(dim=1, keepdim=True))
         y = rgb * (1.0 + self.alpha * t_gate) + self.beta * a_gate
         return self.act(self.bn(y))
+
+
+class SmallAlignConcat(nn.Module):
+    """Align a high-level feature to a low-level feature before concatenation."""
+
+    def __init__(self, channels, max_offset=1.0):
+        super().__init__()
+        if len(channels) != 2:
+            raise ValueError("SmallAlignConcat expects exactly two input feature maps.")
+        c_source, c_target = channels
+        hidden = max(16, min(64, (c_source + c_target) // 8))
+        self.max_offset = max_offset
+        self.offset = nn.Sequential(
+            Conv(c_source + c_target, hidden, 1),
+            nn.Conv2d(hidden, 2, 3, padding=1),
+        )
+        nn.init.zeros_(self.offset[-1].weight)
+        nn.init.zeros_(self.offset[-1].bias)
+
+    @staticmethod
+    def _base_grid(x):
+        b, _, h, w = x.shape
+        ys = torch.arange(h, device=x.device, dtype=x.dtype)
+        xs = torch.arange(w, device=x.device, dtype=x.dtype)
+        try:
+            yy, xx = torch.meshgrid(ys, xs, indexing="ij")
+        except TypeError:
+            yy, xx = torch.meshgrid(ys, xs)
+        grid_x = (xx + 0.5) * (2.0 / w) - 1.0
+        grid_y = (yy + 0.5) * (2.0 / h) - 1.0
+        return torch.stack((grid_x, grid_y), dim=-1).unsqueeze(0).expand(b, h, w, 2)
+
+    def forward(self, x):
+        source, target = x
+        if source.shape[2:] != target.shape[2:]:
+            source = F.interpolate(source, size=target.shape[2:], mode="nearest")
+
+        offset = torch.tanh(self.offset(torch.cat((source, target), dim=1))) * self.max_offset
+        _, _, h, w = source.shape
+        offset_x = offset[:, 0] * (2.0 / w)
+        offset_y = offset[:, 1] * (2.0 / h)
+        grid = self._base_grid(source).clone()
+        grid[..., 0] = grid[..., 0] + offset_x
+        grid[..., 1] = grid[..., 1] + offset_y
+        aligned = F.grid_sample(source, grid, mode="bilinear", padding_mode="border", align_corners=False)
+        return torch.cat((aligned, target), dim=1)
     
 class t_head(nn.Module):
     def __init__(self, c1, c2):
