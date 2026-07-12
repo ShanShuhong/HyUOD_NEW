@@ -6,6 +6,7 @@ import math
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 __all__ = (
     "Conv",
@@ -23,6 +24,10 @@ __all__ = (
     "RepConv",
     "Index",
     "First_Conv",
+    "FirstConvOGOEdgeGate",
+    "FirstConvSobelOGOEdgeGate",
+    "FirstConvConsensusEdgeGate",
+    "FirstConvConsensusEdgeResidual",
 )
 
 
@@ -772,6 +777,261 @@ class First_Conv(nn.Module):
         """
         x = x[:,:3,:,:]
         return self.act(self.conv(x))
+
+
+class FirstConvOGOEdgeGate(nn.Module):
+    """First RGB convolution guided by a zero-initialized OGO edge gate."""
+
+    default_act = nn.SiLU()
+
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True, hidden=16):
+        super().__init__()
+        hidden = max(8, hidden)
+        self.conv = nn.Conv2d(3, c2, k, s, autopad(k, p, d), groups=g, dilation=d, bias=False)
+        self.bn = nn.BatchNorm2d(c2)
+        self.act = self.default_act if act is True else act if isinstance(act, nn.Module) else nn.Identity()
+        self.edge_proj = nn.Sequential(
+            nn.Conv2d(1, hidden, 3, s, 1, bias=False),
+            nn.BatchNorm2d(hidden),
+            nn.SiLU(),
+            nn.Conv2d(hidden, c2, 1, 1, 0, bias=True),
+        )
+        self.alpha = nn.Parameter(torch.zeros(1, c2, 1, 1))
+
+    @staticmethod
+    def _ogo_edge(rgb):
+        gray = 0.299 * rgb[:, 0:1] + 0.587 * rgb[:, 1:2] + 0.114 * rgb[:, 2:3]
+        b, _, h, w = gray.shape
+        padded = F.pad(gray, (1, 1, 1, 1), mode="replicate")
+        patches = F.unfold(padded, kernel_size=3).view(b, 9, h, w)
+        neighbors = torch.cat((patches[:, :4], patches[:, 5:]), dim=1)
+        return torch.atan(torch.abs(gray - neighbors).mean(dim=1, keepdim=True))
+
+    def _edge_gate(self, rgb):
+        edge = self._ogo_edge(rgb)
+        return torch.sigmoid(self.edge_proj(edge))
+
+    def forward(self, x):
+        rgb = x[:, :3, :, :]
+        base = self.act(self.bn(self.conv(rgb)))
+        edge_gate = self._edge_gate(rgb)
+        return base * (1.0 + self.alpha * edge_gate)
+
+    def forward_fuse(self, x):
+        rgb = x[:, :3, :, :]
+        base = self.act(self.conv(rgb))
+        edge_gate = self._edge_gate(rgb)
+        return base * (1.0 + self.alpha * edge_gate)
+
+
+class FirstConvSobelOGOEdgeGate(nn.Module):
+    """First RGB convolution guided by combined Sobel and OGO edge gates."""
+
+    default_act = nn.SiLU()
+
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True, hidden=16):
+        super().__init__()
+        hidden = max(8, hidden)
+        self.conv = nn.Conv2d(3, c2, k, s, autopad(k, p, d), groups=g, dilation=d, bias=False)
+        self.bn = nn.BatchNorm2d(c2)
+        self.act = self.default_act if act is True else act if isinstance(act, nn.Module) else nn.Identity()
+        self.edge_proj = nn.Sequential(
+            nn.Conv2d(2, hidden, 3, s, 1, bias=False),
+            nn.BatchNorm2d(hidden),
+            nn.SiLU(),
+            nn.Conv2d(hidden, c2, 1, 1, 0, bias=True),
+        )
+        sobel_x = torch.tensor(((-1.0, 0.0, 1.0), (-2.0, 0.0, 2.0), (-1.0, 0.0, 1.0))).view(1, 1, 3, 3)
+        sobel_y = torch.tensor(((-1.0, -2.0, -1.0), (0.0, 0.0, 0.0), (1.0, 2.0, 1.0))).view(1, 1, 3, 3)
+        self.register_buffer("sobel_x", sobel_x, persistent=False)
+        self.register_buffer("sobel_y", sobel_y, persistent=False)
+        self.alpha = nn.Parameter(torch.zeros(1, c2, 1, 1))
+
+    @staticmethod
+    def _gray(rgb):
+        return 0.299 * rgb[:, 0:1] + 0.587 * rgb[:, 1:2] + 0.114 * rgb[:, 2:3]
+
+    @staticmethod
+    def _ogo_edge(gray):
+        b, _, h, w = gray.shape
+        padded = F.pad(gray, (1, 1, 1, 1), mode="replicate")
+        patches = F.unfold(padded, kernel_size=3).view(b, 9, h, w)
+        neighbors = torch.cat((patches[:, :4], patches[:, 5:]), dim=1)
+        return torch.atan(torch.abs(gray - neighbors).mean(dim=1, keepdim=True))
+
+    def _sobel_edge(self, gray):
+        sobel_x = self.sobel_x.to(device=gray.device, dtype=gray.dtype)
+        sobel_y = self.sobel_y.to(device=gray.device, dtype=gray.dtype)
+        gx = F.conv2d(gray, sobel_x, padding=1)
+        gy = F.conv2d(gray, sobel_y, padding=1)
+        sobel = torch.atan(torch.sqrt(gx.square() + gy.square() + 1e-6))
+        return sobel
+
+    def _edge_gate(self, rgb):
+        gray = self._gray(rgb)
+        ogo = self._ogo_edge(gray)
+        sobel = self._sobel_edge(gray)
+        edge = torch.cat((ogo, sobel), dim=1)
+        return torch.sigmoid(self.edge_proj(edge))
+
+    def forward(self, x):
+        rgb = x[:, :3, :, :]
+        base = self.act(self.bn(self.conv(rgb)))
+        edge_gate = self._edge_gate(rgb)
+        return base * (1.0 + self.alpha * edge_gate)
+
+    def forward_fuse(self, x):
+        rgb = x[:, :3, :, :]
+        base = self.act(self.conv(rgb))
+        edge_gate = self._edge_gate(rgb)
+        return base * (1.0 + self.alpha * edge_gate)
+
+
+class FirstConvConsensusEdgeGate(nn.Module):
+    """First RGB convolution guided by consensus edge contrast over local background."""
+
+    default_act = nn.SiLU()
+
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True, hidden=16, bg_kernel=9):
+        super().__init__()
+        hidden = max(8, hidden)
+        self.bg_kernel = bg_kernel if bg_kernel % 2 == 1 else bg_kernel + 1
+        self.conv = nn.Conv2d(3, c2, k, s, autopad(k, p, d), groups=g, dilation=d, bias=False)
+        self.bn = nn.BatchNorm2d(c2)
+        self.act = self.default_act if act is True else act if isinstance(act, nn.Module) else nn.Identity()
+        self.edge_proj = nn.Sequential(
+            nn.Conv2d(1, hidden, 3, s, 1, bias=False),
+            nn.BatchNorm2d(hidden),
+            nn.SiLU(),
+            nn.Conv2d(hidden, c2, 1, 1, 0, bias=True),
+        )
+        sobel_x = torch.tensor(((-1.0, 0.0, 1.0), (-2.0, 0.0, 2.0), (-1.0, 0.0, 1.0))).view(1, 1, 3, 3)
+        sobel_y = torch.tensor(((-1.0, -2.0, -1.0), (0.0, 0.0, 0.0), (1.0, 2.0, 1.0))).view(1, 1, 3, 3)
+        self.register_buffer("sobel_x", sobel_x, persistent=False)
+        self.register_buffer("sobel_y", sobel_y, persistent=False)
+        self.alpha = nn.Parameter(torch.zeros(1, c2, 1, 1))
+
+    @staticmethod
+    def _gray(rgb):
+        return 0.299 * rgb[:, 0:1] + 0.587 * rgb[:, 1:2] + 0.114 * rgb[:, 2:3]
+
+    @staticmethod
+    def _normalize(edge):
+        mean = edge.mean(dim=(2, 3), keepdim=True)
+        std = edge.flatten(2).std(dim=2, keepdim=True).view(edge.shape[0], 1, 1, 1).clamp_min(1e-6)
+        return torch.sigmoid((edge - mean) / std)
+
+    @staticmethod
+    def _ogo_edge(gray):
+        b, _, h, w = gray.shape
+        padded = F.pad(gray, (1, 1, 1, 1), mode="replicate")
+        patches = F.unfold(padded, kernel_size=3).view(b, 9, h, w)
+        neighbors = torch.cat((patches[:, :4], patches[:, 5:]), dim=1)
+        return torch.atan(torch.abs(gray - neighbors).mean(dim=1, keepdim=True))
+
+    def _sobel_edge(self, gray):
+        sobel_x = self.sobel_x.to(device=gray.device, dtype=gray.dtype)
+        sobel_y = self.sobel_y.to(device=gray.device, dtype=gray.dtype)
+        padded = F.pad(gray, (1, 1, 1, 1), mode="replicate")
+        gx = F.conv2d(padded, sobel_x)
+        gy = F.conv2d(padded, sobel_y)
+        return torch.atan(torch.sqrt(gx.square() + gy.square() + 1e-6))
+
+    def _edge_gate(self, rgb):
+        gray = self._gray(rgb)
+        ogo = self._normalize(self._ogo_edge(gray))
+        sobel = self._normalize(self._sobel_edge(gray))
+        consensus = torch.sqrt((ogo * sobel).clamp_min(1e-6))
+        local_bg = F.avg_pool2d(consensus, self.bg_kernel, stride=1, padding=self.bg_kernel // 2)
+        contrast = (consensus - local_bg).clamp_min(0.0)
+        return torch.sigmoid(self.edge_proj(contrast))
+
+    def forward(self, x):
+        rgb = x[:, :3, :, :]
+        base = self.act(self.bn(self.conv(rgb)))
+        edge_gate = self._edge_gate(rgb)
+        return base * (1.0 + self.alpha * edge_gate)
+
+    def forward_fuse(self, x):
+        rgb = x[:, :3, :, :]
+        base = self.act(self.conv(rgb))
+        edge_gate = self._edge_gate(rgb)
+        return base * (1.0 + self.alpha * edge_gate)
+
+
+class FirstConvConsensusEdgeResidual(nn.Module):
+    """First RGB convolution with additive consensus-edge residual features."""
+
+    default_act = nn.SiLU()
+
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True, hidden=16, bg_kernel=9):
+        super().__init__()
+        hidden = max(8, hidden)
+        self.bg_kernel = bg_kernel if bg_kernel % 2 == 1 else bg_kernel + 1
+        self.conv = nn.Conv2d(3, c2, k, s, autopad(k, p, d), groups=g, dilation=d, bias=False)
+        self.bn = nn.BatchNorm2d(c2)
+        self.act = self.default_act if act is True else act if isinstance(act, nn.Module) else nn.Identity()
+        self.edge_proj = nn.Sequential(
+            nn.Conv2d(1, hidden, 3, s, 1, bias=False),
+            nn.BatchNorm2d(hidden),
+            nn.SiLU(),
+            nn.Conv2d(hidden, c2, 1, 1, 0, bias=False),
+            nn.BatchNorm2d(c2),
+        )
+        sobel_x = torch.tensor(((-1.0, 0.0, 1.0), (-2.0, 0.0, 2.0), (-1.0, 0.0, 1.0))).view(1, 1, 3, 3)
+        sobel_y = torch.tensor(((-1.0, -2.0, -1.0), (0.0, 0.0, 0.0), (1.0, 2.0, 1.0))).view(1, 1, 3, 3)
+        self.register_buffer("sobel_x", sobel_x, persistent=False)
+        self.register_buffer("sobel_y", sobel_y, persistent=False)
+        self.alpha = nn.Parameter(torch.zeros(1, c2, 1, 1))
+
+    @staticmethod
+    def _gray(rgb):
+        return 0.299 * rgb[:, 0:1] + 0.587 * rgb[:, 1:2] + 0.114 * rgb[:, 2:3]
+
+    @staticmethod
+    def _normalize(edge):
+        mean = edge.mean(dim=(2, 3), keepdim=True)
+        std = edge.flatten(2).std(dim=2, keepdim=True).view(edge.shape[0], 1, 1, 1).clamp_min(1e-6)
+        return torch.sigmoid((edge - mean) / std)
+
+    @staticmethod
+    def _ogo_edge(gray):
+        b, _, h, w = gray.shape
+        padded = F.pad(gray, (1, 1, 1, 1), mode="replicate")
+        patches = F.unfold(padded, kernel_size=3).view(b, 9, h, w)
+        neighbors = torch.cat((patches[:, :4], patches[:, 5:]), dim=1)
+        return torch.atan(torch.abs(gray - neighbors).mean(dim=1, keepdim=True))
+
+    def _sobel_edge(self, gray):
+        sobel_x = self.sobel_x.to(device=gray.device, dtype=gray.dtype)
+        sobel_y = self.sobel_y.to(device=gray.device, dtype=gray.dtype)
+        padded = F.pad(gray, (1, 1, 1, 1), mode="replicate")
+        gx = F.conv2d(padded, sobel_x)
+        gy = F.conv2d(padded, sobel_y)
+        return torch.atan(torch.sqrt(gx.square() + gy.square() + 1e-6))
+
+    def _edge_contrast(self, rgb):
+        gray = self._gray(rgb)
+        ogo = self._normalize(self._ogo_edge(gray))
+        sobel = self._normalize(self._sobel_edge(gray))
+        consensus = torch.sqrt((ogo * sobel).clamp_min(1e-6))
+        local_bg = F.avg_pool2d(consensus, self.bg_kernel, stride=1, padding=self.bg_kernel // 2)
+        contrast = (consensus - local_bg).clamp_min(0.0)
+        return contrast
+
+    def forward(self, x):
+        rgb = x[:, :3, :, :]
+        base = self.act(self.bn(self.conv(rgb)))
+        contrast = self._edge_contrast(rgb)
+        edge_residual = self.edge_proj(contrast)
+        return base + self.alpha * edge_residual
+
+    def forward_fuse(self, x):
+        rgb = x[:, :3, :, :]
+        base = self.act(self.conv(rgb))
+        contrast = self._edge_contrast(rgb)
+        edge_residual = self.edge_proj(contrast)
+        return base + self.alpha * edge_residual
 '''
 from .ops_dcnv3.modules import DCNv3,DCNv3_pytorch
 

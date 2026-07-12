@@ -57,8 +57,10 @@ __all__ = (
     "Input_agent",
     "PhysicsTA",
     "PhysicsTABaseline",
+    "OGOEdgeHead",
     "LightPhysicalGate",
     "SmallAlignConcat",
+    "BalancedAlignConcat",
     "t_head",
     "A_head",
     "t_block",
@@ -1959,6 +1961,32 @@ class PhysicsTABaseline(nn.Module):
         return torch.cat((rgb, t_rgb, a_rgb), dim=1)
 
 
+class OGOEdgeHead(nn.Module):
+    """Extract an oblique-gradient edge prompt from RGB and project it to a feature map."""
+
+    def __init__(self, c1, c2, stride=4, hidden=16):
+        super().__init__()
+        if stride < 1:
+            raise ValueError("OGOEdgeHead stride must be >= 1.")
+        hidden = max(8, hidden)
+        self.pool = nn.AvgPool2d(kernel_size=stride, stride=stride) if stride > 1 else nn.Identity()
+        self.proj = nn.Sequential(
+            Conv(1, hidden, 3),
+            Conv(hidden, c2, 3),
+        )
+
+    def forward(self, x):
+        rgb = x[:, :3, :, :]
+        gray = 0.299 * rgb[:, 0:1] + 0.587 * rgb[:, 1:2] + 0.114 * rgb[:, 2:3]
+        b, _, h, w = gray.shape
+        padded = F.pad(gray, (1, 1, 1, 1), mode="replicate")
+        patches = F.unfold(padded, kernel_size=3).view(b, 9, h, w)
+        neighbors = torch.cat((patches[:, :4], patches[:, 5:]), dim=1)
+        edge = torch.atan(torch.abs(gray - neighbors).mean(dim=1, keepdim=True))
+        edge = self.pool(edge)
+        return self.proj(edge)
+
+
 class LightPhysicalGate(nn.Module):
     """Low-parameter T/A gate for deep features."""
 
@@ -2024,6 +2052,61 @@ class SmallAlignConcat(nn.Module):
         grid[..., 1] = grid[..., 1] + offset_y
         aligned = F.grid_sample(source, grid, mode="bilinear", padding_mode="border", align_corners=False)
         return torch.cat((aligned, target), dim=1)
+
+
+class BalancedAlignConcat(nn.Module):
+    """Align features, then learn a conservative spatial balance before concatenation."""
+
+    def __init__(self, channels, max_offset=1.0, gate_scale=0.25):
+        super().__init__()
+        if len(channels) != 2:
+            raise ValueError("BalancedAlignConcat expects exactly two input feature maps.")
+        c_source, c_target = channels
+        hidden = max(16, min(64, (c_source + c_target) // 8))
+        self.max_offset = max_offset
+        self.gate_scale = gate_scale
+        self.offset = nn.Sequential(
+            Conv(c_source + c_target, hidden, 1),
+            nn.Conv2d(hidden, 2, 3, padding=1),
+        )
+        self.gate = nn.Sequential(
+            Conv(c_source + c_target, hidden, 1),
+            nn.Conv2d(hidden, 2, 3, padding=1),
+        )
+        nn.init.zeros_(self.offset[-1].weight)
+        nn.init.zeros_(self.offset[-1].bias)
+        nn.init.zeros_(self.gate[-1].weight)
+        nn.init.zeros_(self.gate[-1].bias)
+
+    @staticmethod
+    def _base_grid(x):
+        b, _, h, w = x.shape
+        ys = torch.arange(h, device=x.device, dtype=x.dtype)
+        xs = torch.arange(w, device=x.device, dtype=x.dtype)
+        try:
+            yy, xx = torch.meshgrid(ys, xs, indexing="ij")
+        except TypeError:
+            yy, xx = torch.meshgrid(ys, xs)
+        grid_x = (xx + 0.5) * (2.0 / w) - 1.0
+        grid_y = (yy + 0.5) * (2.0 / h) - 1.0
+        return torch.stack((grid_x, grid_y), dim=-1).unsqueeze(0).expand(b, h, w, 2)
+
+    def forward(self, x):
+        source, target = x
+        if source.shape[2:] != target.shape[2:]:
+            source = F.interpolate(source, size=target.shape[2:], mode="nearest")
+
+        offset = torch.tanh(self.offset(torch.cat((source, target), dim=1))) * self.max_offset
+        _, _, h, w = source.shape
+        offset_x = offset[:, 0] * (2.0 / w)
+        offset_y = offset[:, 1] * (2.0 / h)
+        grid = self._base_grid(source).clone()
+        grid[..., 0] = grid[..., 0] + offset_x
+        grid[..., 1] = grid[..., 1] + offset_y
+        aligned = F.grid_sample(source, grid, mode="bilinear", padding_mode="border", align_corners=False)
+        weights = 1.0 + self.gate_scale * torch.tanh(self.gate(torch.cat((aligned, target), dim=1)))
+        source_weight, target_weight = weights.chunk(2, dim=1)
+        return torch.cat((aligned * source_weight, target * target_weight), dim=1)
 
 
 class t_head(nn.Module):
