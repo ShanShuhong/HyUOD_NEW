@@ -66,12 +66,19 @@ from ultralytics.nn.modules import (
     Input_agent,
     PhysicsTA,
     PhysicsTABaseline,
+    OGOEdgeHead,
     LightPhysicalGate,
     SmallAlignConcat,
+    BalancedAlignConcat,
+    SemanticGuardAlignConcat,
     t_head,
     A_head,
     frequent_block,
     First_Conv,
+    FirstConvOGOEdgeGate,
+    FirstConvSobelOGOEdgeGate,
+    FirstConvConsensusEdgeGate,
+    FirstConvConsensusEdgeResidual,
     t_block,
     A_block,
     C3k2_wcpm,
@@ -1148,6 +1155,10 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             A_head,
             frequent_block,
             First_Conv,
+            FirstConvOGOEdgeGate,
+            FirstConvSobelOGOEdgeGate,
+            FirstConvConsensusEdgeGate,
+            FirstConvConsensusEdgeResidual,
             t_block,
             A_block,
             C3k2_wcpm,
@@ -1209,7 +1220,11 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
         elif m in frozenset({PhysicsTA, PhysicsTABaseline}):
             c1, c2 = ch[f], 9
             args = [c1, c2, *args[1:]]
-        elif m is SmallAlignConcat:
+        elif m is OGOEdgeHead:
+            c1, c2 = ch[f], args[0]
+            c2 = make_divisible(min(c2, max_channels) * width, 8)
+            args = [c1, c2, *args[1:]]
+        elif m in frozenset({SmallAlignConcat, BalancedAlignConcat, SemanticGuardAlignConcat}):
             c2 = sum(ch[x] for x in f)
             args = [[ch[x] for x in f], *args]
         elif m is AIFI:
