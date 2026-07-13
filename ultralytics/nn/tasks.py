@@ -70,6 +70,7 @@ from ultralytics.nn.modules import (
     LightPhysicalGate,
     SmallAlignConcat,
     BalancedAlignConcat,
+    SemanticGuardAlignConcat,
     t_head,
     A_head,
     frequent_block,
@@ -1223,7 +1224,7 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             c1, c2 = ch[f], args[0]
             c2 = make_divisible(min(c2, max_channels) * width, 8)
             args = [c1, c2, *args[1:]]
-        elif m in frozenset({SmallAlignConcat, BalancedAlignConcat}):
+        elif m in frozenset({SmallAlignConcat, BalancedAlignConcat, SemanticGuardAlignConcat}):
             c2 = sum(ch[x] for x in f)
             args = [[ch[x] for x in f], *args]
         elif m is AIFI:

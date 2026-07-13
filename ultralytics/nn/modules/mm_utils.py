@@ -1,4 +1,3 @@
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -171,14 +170,15 @@ class BrokenBlock(nn.Module):
         self.dim = dim
         self.group = group
         self.dim_len = dim_len
-        self.view = list(np.ones(dim_shape, int))
+        self.view = [1] * dim_shape
 
     def getShuffle(self, shape):
-        # 生成随机索引
-        self.view[self.dim] = shape[self.dim]
-        perm = torch.randperm(self.dim_len//self.group).unsqueeze(1)
+        # 生成随机索引 (use local copy to avoid mutating shared state)
+        view = list(self.view)
+        view[self.dim] = shape[self.dim]
+        perm = torch.randperm(self.dim_len // self.group).unsqueeze(1)
         indices = torch.cat([perm * self.group + _ for _ in range(self.group)], dim=1)
-        indices = indices.view(self.view).expand(shape)
+        indices = indices.view(view).expand(shape)
         return indices
 
     def forward(self, x):
@@ -188,14 +188,12 @@ class BrokenBlock(nn.Module):
             return x
 
 class _ScaleModule(nn.Module):
-    def __init__(self, dims, init_scale=1.0, init_bias=0):
+    def __init__(self, dims, init_scale=1.0):
         super(_ScaleModule, self).__init__()
-        self.dims = dims
-        self.weight = nn.Parameter(torch.ones(*dims) * init_scale)
-        self.bias = None
-    
+        self.weight = nn.Parameter(torch.full(dims, init_scale))
+
     def forward(self, x):
-        return torch.mul(self.weight, x)
+        return self.weight * x
     
 def create_wavelet_filter(wave, in_size, out_size, type=torch.float):
     w = pywt.Wavelet(wave)

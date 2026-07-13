@@ -61,6 +61,7 @@ __all__ = (
     "LightPhysicalGate",
     "SmallAlignConcat",
     "BalancedAlignConcat",
+    "SemanticGuardAlignConcat",
     "t_head",
     "A_head",
     "t_block",
@@ -1923,6 +1924,12 @@ class PhysicsTA(nn.Module):
 class PhysicsTABaseline(nn.Module):
     """Generate baseline-aligned RGB+T+A channels from RGB input inside the network."""
 
+    # Precomputed wavelength-dependent scattering coefficients (λ in nm)
+    # coeff(λ) = -0.00113 * λ + 1.62517
+    _COEFF_700 = -0.00113 * 700 + 1.62517  # 0.83417
+    _COEFF_550 = -0.00113 * 550 + 1.62517  # 1.00367
+    _COEFF_450 = -0.00113 * 450 + 1.62517  # 1.11667
+
     def __init__(self, c1=3, c2=9, pool_kernel=3, top_ratio=0.01, w=0.95):
         super().__init__()
         if c2 != 9:
@@ -1948,12 +1955,14 @@ class PhysicsTABaseline(nn.Module):
 
         norm_bgr = bgr / atom_bgr
         t_b = (1.0 - self.w * self._dark_channel_bg(norm_bgr)).clamp(0.1, 0.9)
-        eta_r_over_eta_b = ((-0.00113 * 700 + 1.62517) * atom_bgr[:, 0:1]) / (
-                (-0.00113 * 450 + 1.62517) * atom_bgr[:, 2:3]
-        )
-        eta_g_over_eta_b = ((-0.00113 * 550 + 1.62517) * atom_bgr[:, 0:1]) / (
-                (-0.00113 * 450 + 1.62517) * atom_bgr[:, 1:2]
-        )
+
+        atom_b = atom_bgr[:, 0:1]
+        atom_g = atom_bgr[:, 1:2]
+        atom_r = atom_bgr[:, 2:3]
+        eta_b = self._COEFF_450 * atom_r
+        eta_r_over_eta_b = (self._COEFF_700 * atom_b) / eta_b.clamp_min(1e-6)
+        eta_g_over_eta_b = (self._COEFF_550 * atom_b) / (self._COEFF_450 * atom_g).clamp_min(1e-6)
+
         t_r = t_b.pow(eta_r_over_eta_b.clamp(0.25, 4.0))
         t_g = t_b.pow(eta_g_over_eta_b.clamp(0.25, 4.0))
         t_rgb = torch.cat((t_r, t_g, t_b), dim=1)
@@ -2011,6 +2020,19 @@ class LightPhysicalGate(nn.Module):
 class SmallAlignConcat(nn.Module):
     """Align a high-level feature to a low-level feature before concatenation."""
 
+    # Detect torch.meshgrid indexing support once at class-definition time
+    _MESHGRID_HAS_IJ = None
+
+    @classmethod
+    def _detect_meshgrid_indexing(cls):
+        if cls._MESHGRID_HAS_IJ is None:
+            try:
+                torch.meshgrid(torch.zeros(1), torch.zeros(1), indexing="ij")
+                cls._MESHGRID_HAS_IJ = True
+            except TypeError:
+                cls._MESHGRID_HAS_IJ = False
+        return cls._MESHGRID_HAS_IJ
+
     def __init__(self, channels, max_offset=1.0):
         super().__init__()
         if len(channels) != 2:
@@ -2024,19 +2046,19 @@ class SmallAlignConcat(nn.Module):
         )
         nn.init.zeros_(self.offset[-1].weight)
         nn.init.zeros_(self.offset[-1].bias)
+        self._detect_meshgrid_indexing()
 
     @staticmethod
-    def _base_grid(x):
-        b, _, h, w = x.shape
-        ys = torch.arange(h, device=x.device, dtype=x.dtype)
-        xs = torch.arange(w, device=x.device, dtype=x.dtype)
-        try:
+    def _base_grid(h, w, device, dtype, use_ij):
+        ys = torch.arange(h, device=device, dtype=dtype)
+        xs = torch.arange(w, device=device, dtype=dtype)
+        if use_ij:
             yy, xx = torch.meshgrid(ys, xs, indexing="ij")
-        except TypeError:
+        else:
             yy, xx = torch.meshgrid(ys, xs)
         grid_x = (xx + 0.5) * (2.0 / w) - 1.0
         grid_y = (yy + 0.5) * (2.0 / h) - 1.0
-        return torch.stack((grid_x, grid_y), dim=-1).unsqueeze(0).expand(b, h, w, 2)
+        return grid_x, grid_y
 
     def forward(self, x):
         source, target = x
@@ -2044,18 +2066,35 @@ class SmallAlignConcat(nn.Module):
             source = F.interpolate(source, size=target.shape[2:], mode="nearest")
 
         offset = torch.tanh(self.offset(torch.cat((source, target), dim=1))) * self.max_offset
-        _, _, h, w = source.shape
+        b, _, h, w = source.shape
         offset_x = offset[:, 0] * (2.0 / w)
         offset_y = offset[:, 1] * (2.0 / h)
-        grid = self._base_grid(source).clone()
-        grid[..., 0] = grid[..., 0] + offset_x
-        grid[..., 1] = grid[..., 1] + offset_y
+
+        use_ij = self._MESHGRID_HAS_IJ
+        grid_x, grid_y = self._base_grid(h, w, source.device, source.dtype, use_ij)
+        grid_x = grid_x.unsqueeze(0).expand(b, h, w) + offset_x
+        grid_y = grid_y.unsqueeze(0).expand(b, h, w) + offset_y
+        grid = torch.stack((grid_x, grid_y), dim=-1)
+
         aligned = F.grid_sample(source, grid, mode="bilinear", padding_mode="border", align_corners=False)
         return torch.cat((aligned, target), dim=1)
 
 
 class BalancedAlignConcat(nn.Module):
     """Align features, then learn a conservative spatial balance before concatenation."""
+
+    # Detect torch.meshgrid indexing support once at class-definition time
+    _MESHGRID_HAS_IJ = None
+
+    @classmethod
+    def _detect_meshgrid_indexing(cls):
+        if cls._MESHGRID_HAS_IJ is None:
+            try:
+                torch.meshgrid(torch.zeros(1), torch.zeros(1), indexing="ij")
+                cls._MESHGRID_HAS_IJ = True
+            except TypeError:
+                cls._MESHGRID_HAS_IJ = False
+        return cls._MESHGRID_HAS_IJ
 
     def __init__(self, channels, max_offset=1.0, gate_scale=0.25):
         super().__init__()
@@ -2077,19 +2116,19 @@ class BalancedAlignConcat(nn.Module):
         nn.init.zeros_(self.offset[-1].bias)
         nn.init.zeros_(self.gate[-1].weight)
         nn.init.zeros_(self.gate[-1].bias)
+        self._detect_meshgrid_indexing()
 
     @staticmethod
-    def _base_grid(x):
-        b, _, h, w = x.shape
-        ys = torch.arange(h, device=x.device, dtype=x.dtype)
-        xs = torch.arange(w, device=x.device, dtype=x.dtype)
-        try:
+    def _base_grid(h, w, device, dtype, use_ij):
+        ys = torch.arange(h, device=device, dtype=dtype)
+        xs = torch.arange(w, device=device, dtype=dtype)
+        if use_ij:
             yy, xx = torch.meshgrid(ys, xs, indexing="ij")
-        except TypeError:
+        else:
             yy, xx = torch.meshgrid(ys, xs)
         grid_x = (xx + 0.5) * (2.0 / w) - 1.0
         grid_y = (yy + 0.5) * (2.0 / h) - 1.0
-        return torch.stack((grid_x, grid_y), dim=-1).unsqueeze(0).expand(b, h, w, 2)
+        return grid_x, grid_y
 
     def forward(self, x):
         source, target = x
@@ -2097,16 +2136,59 @@ class BalancedAlignConcat(nn.Module):
             source = F.interpolate(source, size=target.shape[2:], mode="nearest")
 
         offset = torch.tanh(self.offset(torch.cat((source, target), dim=1))) * self.max_offset
-        _, _, h, w = source.shape
+        b, _, h, w = source.shape
         offset_x = offset[:, 0] * (2.0 / w)
         offset_y = offset[:, 1] * (2.0 / h)
-        grid = self._base_grid(source).clone()
-        grid[..., 0] = grid[..., 0] + offset_x
-        grid[..., 1] = grid[..., 1] + offset_y
+
+        use_ij = self._MESHGRID_HAS_IJ
+        grid_x, grid_y = self._base_grid(h, w, source.device, source.dtype, use_ij)
+        grid_x = grid_x.unsqueeze(0).expand(b, h, w) + offset_x
+        grid_y = grid_y.unsqueeze(0).expand(b, h, w) + offset_y
+        grid = torch.stack((grid_x, grid_y), dim=-1)
+
         aligned = F.grid_sample(source, grid, mode="bilinear", padding_mode="border", align_corners=False)
         weights = 1.0 + self.gate_scale * torch.tanh(self.gate(torch.cat((aligned, target), dim=1)))
         source_weight, target_weight = weights.chunk(2, dim=1)
         return torch.cat((aligned * source_weight, target * target_weight), dim=1)
+
+
+class SemanticGuardAlignConcat(SmallAlignConcat):
+    """Align high-level features, then use them to guard low-level detail features."""
+
+    def __init__(self, channels, max_offset=1.0, gate_scale=0.25):
+        if len(channels) != 2:
+            raise ValueError("SemanticGuardAlignConcat expects exactly two input feature maps.")
+        super().__init__(channels, max_offset)
+        c_source, _ = channels
+        hidden = max(16, min(64, c_source // 8))
+        self.gate_scale = gate_scale
+        self.semantic_gate = nn.Sequential(
+            Conv(c_source, hidden, 1),
+            nn.Conv2d(hidden, 1, 3, padding=1),
+        )
+        nn.init.zeros_(self.semantic_gate[-1].weight)
+        nn.init.zeros_(self.semantic_gate[-1].bias)
+
+    def forward(self, x):
+        source, target = x
+        if source.shape[2:] != target.shape[2:]:
+            source = F.interpolate(source, size=target.shape[2:], mode="nearest")
+
+        offset = torch.tanh(self.offset(torch.cat((source, target), dim=1))) * self.max_offset
+        b, _, h, w = source.shape
+        offset_x = offset[:, 0] * (2.0 / w)
+        offset_y = offset[:, 1] * (2.0 / h)
+
+        use_ij = self._MESHGRID_HAS_IJ
+        grid_x, grid_y = self._base_grid(h, w, source.device, source.dtype, use_ij)
+        grid_x = grid_x.unsqueeze(0).expand(b, h, w) + offset_x
+        grid_y = grid_y.unsqueeze(0).expand(b, h, w) + offset_y
+        grid = torch.stack((grid_x, grid_y), dim=-1)
+
+        aligned = F.grid_sample(source, grid, mode="bilinear", padding_mode="border", align_corners=False)
+        semantic_gate = 1.0 + self.gate_scale * torch.tanh(self.semantic_gate(aligned))
+        guarded_target = target * semantic_gate
+        return torch.cat((aligned, guarded_target), dim=1)
 
 
 class t_head(nn.Module):
@@ -2151,22 +2233,17 @@ class t_block(nn.Module):
 class A_block(nn.Module):
     def __init__(self, c1, c2, level, down=False, k=1, s=1, p=0):
         super(A_block, self).__init__()
-        # self.down = nn.AvgPool2d(kernel_size=2, stride=2)
         self.dyconv1 = DynamicConv(in_planes=c1, out_planes=c2, kernel_size=k, stride=s, padding=p, bias=False)
         self.upsample = nn.Upsample(scale_factor=2 ** (4 - level), mode='nearest')
-        if down is True:
-            self.scale = 2 ** (5 - level)
         self.down = down
-        # return F.interpolate(x, size=target_size, mode='nearest')
+        if self.down:
+            self.scale = 2 ** (5 - level)
 
     def forward(self, x):
-        # x = torch.cat([x[0][:,-3:,:,:],x[1]],1)
-        if self.down is True:
+        if self.down:
             h, w = x.shape[2:]
-            target_size = (h // self.scale, w // self.scale)
-            x = F.interpolate(x, size=target_size, mode='nearest')
-        x = self.upsample(self.dyconv1(x))
-        return x
+            x = F.interpolate(x, size=(h // self.scale, w // self.scale), mode='nearest')
+        return self.upsample(self.dyconv1(x))
 
 
 class MWT_CSP_V1_newSG(nn.Module):
@@ -2466,7 +2543,7 @@ class DyAttention(nn.Module):
 
 
 def channel_shuffle(x, groups):
-    batchsize, num_channels, height, width = x.data.size()
+    batchsize, num_channels, height, width = x.size()
     channels_per_group = num_channels // groups
     x = x.view(batchsize, groups, channels_per_group, height, width)
     x = torch.transpose(x, 1, 2).contiguous()
