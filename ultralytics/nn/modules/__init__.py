@@ -71,6 +71,7 @@ from .block import (
     A_block,
     frequent_block,
     TBSepFrequentBlock,
+    TBSepTargetOnlyBlock,
     C3k2_wcpm,
 )
 from .conv import (
@@ -191,5 +192,6 @@ __all__ = (
     "First_Conv",
     "frequent_block",
     "TBSepFrequentBlock",
+    "TBSepTargetOnlyBlock",
     "C3k2_wcpm",
 )

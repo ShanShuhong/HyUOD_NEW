@@ -67,6 +67,7 @@ __all__ = (
     "A_block",
     "frequent_block",
     "TBSepFrequentBlock",
+    "TBSepTargetOnlyBlock",
     "C3k2_wcpm",
 )
 
@@ -2349,6 +2350,26 @@ class TBSepFrequentBlock(frequent_block):
         target_detail = self.target_proj(target)
         background_gate = torch.sigmoid(self.background_gate(background))
         return feat + self.alpha * target_detail - self.beta * background_gate * background
+
+
+class TBSepTargetOnlyBlock(frequent_block):
+    """Target-residual-only frequent block, preserving confidence stability."""
+
+    def __init__(self, c1, c2, e=0.5, bg_kernel=7):
+        super().__init__(c1, c2, e)
+        self.bg_kernel = bg_kernel
+        self.target_proj = nn.Sequential(
+            DWConv(c2, c2, 3),
+            nn.Conv2d(c2, c2, 1, bias=False),
+        )
+        self.alpha = nn.Parameter(torch.zeros(1, c2, 1, 1))
+
+    def forward(self, x):
+        feat = super().forward(x)
+        background = F.avg_pool2d(feat, self.bg_kernel, stride=1, padding=self.bg_kernel // 2)
+        target = feat - background
+        target_detail = self.target_proj(target)
+        return feat + self.alpha * target_detail
 
 
 class DynamicConv(nn.Module):
