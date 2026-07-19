@@ -168,9 +168,26 @@ class v8DetectionLoss:
 
         self.use_dfl = m.reg_max > 1
 
-        self.assigner = TaskAlignedAssigner(topk=tal_topk, num_classes=self.nc, alpha=0.5, beta=6.0)
+        self.tal_topk_per_class = self._init_tal_topk_per_class(model)
+        self.assigner = TaskAlignedAssigner(
+            topk=tal_topk, num_classes=self.nc, alpha=0.5, beta=6.0, topk_per_class=self.tal_topk_per_class
+        )
         self.bbox_loss = BboxLoss(m.reg_max).to(device)
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
+
+    def _init_tal_topk_per_class(self, model):
+        """Read optional class-aware TAL top-k settings from model yaml."""
+        topk_per_class = getattr(model, "yaml", {}).get("tal_topk_per_class")
+        if topk_per_class is None:
+            return None
+        if not isinstance(topk_per_class, (list, tuple)):
+            raise TypeError("tal_topk_per_class must be a list or tuple with one integer per class.")
+        if len(topk_per_class) != self.nc:
+            raise ValueError(f"tal_topk_per_class length {len(topk_per_class)} does not match model nc={self.nc}.")
+        topk_per_class = [int(v) for v in topk_per_class]
+        if min(topk_per_class) < 1:
+            raise ValueError("tal_topk_per_class values must be positive integers.")
+        return topk_per_class
 
     def preprocess(self, targets, batch_size, scale_tensor):
         """Preprocess targets by converting to tensor format and scaling coordinates."""

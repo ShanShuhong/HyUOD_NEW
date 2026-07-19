@@ -27,7 +27,7 @@ class TaskAlignedAssigner(nn.Module):
         eps (float): A small value to prevent division by zero.
     """
 
-    def __init__(self, topk=13, num_classes=80, alpha=1.0, beta=6.0, eps=1e-9):
+    def __init__(self, topk=13, num_classes=80, alpha=1.0, beta=6.0, eps=1e-9, topk_per_class=None):
         """Initialize a TaskAlignedAssigner object with customizable hyperparameters."""
         super().__init__()
         self.topk = topk
@@ -36,6 +36,8 @@ class TaskAlignedAssigner(nn.Module):
         self.alpha = alpha
         self.beta = beta
         self.eps = eps
+        self.topk_per_class = topk_per_class
+        self.max_topk = max(topk, max(topk_per_class)) if topk_per_class is not None else topk
 
     @torch.no_grad()
     def forward(self, pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt):
@@ -140,11 +142,31 @@ class TaskAlignedAssigner(nn.Module):
         # Get anchor_align metric, (b, max_num_obj, h*w)
         align_metric, overlaps = self.get_box_metrics(pd_scores, pd_bboxes, gt_labels, gt_bboxes, mask_in_gts * mask_gt)
         # Get topk_metric mask, (b, max_num_obj, h*w)
-        mask_topk = self.select_topk_candidates(align_metric, topk_mask=mask_gt.expand(-1, -1, self.topk).bool())
+        topk_counts = self.get_gt_topk_counts(gt_labels)
+        mask_topk = self.select_topk_candidates(
+            align_metric, topk_mask=self.build_topk_mask(mask_gt, topk_counts)
+        )
         # Merge all mask to a final mask, (b, max_num_obj, h*w)
         mask_pos = mask_topk * mask_in_gts * mask_gt
 
         return mask_pos, align_metric, overlaps
+
+    def get_gt_topk_counts(self, gt_labels):
+        """Return per-GT top-k counts according to ground-truth class labels."""
+        if self.topk_per_class is None:
+            return None
+
+        class_topk = torch.tensor(self.topk_per_class, dtype=torch.long, device=gt_labels.device)
+        labels = gt_labels.squeeze(-1).long().clamp_(0, self.num_classes - 1)
+        return class_topk[labels].clamp_(1, self.max_topk)
+
+    def build_topk_mask(self, mask_gt, topk_counts):
+        """Build a valid top-k rank mask for fixed or class-aware TAL assignment."""
+        if topk_counts is None:
+            return mask_gt.expand(-1, -1, self.max_topk).bool()
+
+        topk_rank = torch.arange(self.max_topk, device=mask_gt.device).view(1, 1, -1)
+        return (topk_rank < topk_counts.unsqueeze(-1)) & mask_gt.expand(-1, -1, self.max_topk).bool()
 
     def get_box_metrics(self, pd_scores, pd_bboxes, gt_labels, gt_bboxes, mask_gt):
         """
@@ -210,7 +232,7 @@ class TaskAlignedAssigner(nn.Module):
             (torch.Tensor): A tensor of shape (b, max_num_obj, h*w) containing the selected top-k candidates.
         """
         # (b, max_num_obj, topk)
-        topk_metrics, topk_idxs = torch.topk(metrics, self.topk, dim=-1, largest=largest)
+        topk_metrics, topk_idxs = torch.topk(metrics, self.max_topk, dim=-1, largest=largest)
         if topk_mask is None:
             topk_mask = (topk_metrics.max(-1, keepdim=True)[0] > self.eps).expand_as(topk_idxs)
         # (b, max_num_obj, topk)
@@ -218,10 +240,14 @@ class TaskAlignedAssigner(nn.Module):
 
         # (b, max_num_obj, topk, h*w) -> (b, max_num_obj, h*w)
         count_tensor = torch.zeros(metrics.shape, dtype=torch.int8, device=topk_idxs.device)
-        ones = torch.ones_like(topk_idxs[:, :, :1], dtype=torch.int8, device=topk_idxs.device)
-        for k in range(self.topk):
+        ones = torch.where(
+            topk_mask,
+            torch.ones_like(topk_idxs, dtype=torch.int8),
+            torch.zeros_like(topk_idxs, dtype=torch.int8),
+        )
+        for k in range(self.max_topk):
             # Expand topk_idxs for each value of k and add 1 at the specified positions
-            count_tensor.scatter_add_(-1, topk_idxs[:, :, k : k + 1], ones)
+            count_tensor.scatter_add_(-1, topk_idxs[:, :, k : k + 1], ones[:, :, k : k + 1])
         # Filter invalid bboxes
         count_tensor.masked_fill_(count_tensor > 1, 0)
 

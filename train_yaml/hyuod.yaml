@@ -1,5 +1,11 @@
+# Ultralytics YOLO, AGPL-3.0 license
+# Class-aware TAL top-k assignment with stronger echinus sampling on the good train48 baseline.
+
+# Parameters
 ch: 3
 nc: 80
+# class order: holothurian, echinus, scallop, starfish
+tal_topk_per_class: [10, 14, 10, 12]
 scales:
   n: [0.50, 0.25, 1024]
   s: [0.50, 0.50, 1024]
